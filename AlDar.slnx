@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AlDar.Api/AlDar.Api.csproj" />
+    <Project Path="src/AlDar.Application/AlDar.Application.csproj" />
+    <Project Path="src/AlDar.Domain/AlDar.Domain.csproj" />
+    <Project Path="src/AlDar.Infrastructure/AlDar.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AlDar.Api.IntegrationTests/AlDar.Api.IntegrationTests.csproj" />
+    <Project Path="tests/AlDar.Infrastructure.Tests/AlDar.Infrastructure.UnitTests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,6 @@
+@AlDar.Api_HostAddress = http://localhost:5258
+
+GET {{AlDar.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
