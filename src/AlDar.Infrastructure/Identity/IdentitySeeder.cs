@@ -6,33 +6,39 @@ namespace AlDar.Infrastructure.Identity;
 
 public static class IdentitySeeder
 {
-    public static async Task SeedRolesAsync( IServiceProvider service)
+    public static async Task SeedRolesAsync(
+        IServiceProvider serviceProvider)
     {
-            var roles = new[]
-            {
-                Roles.Admin,
-                Roles.Teacher,
-                Roles.Student
-            };
+        var roles = new[]
+        {
+            Roles.Admin,
+            Roles.Teacher,
+            Roles.Student
+        };
 
-        var roleManager = service.GetService<RoleManager<IdentityRole>>();
+        var roleManager =
+            serviceProvider.GetRequiredService<RoleManager<IdentityRole>>();
+
         foreach (var role in roles)
         {
             if (await roleManager.RoleExistsAsync(role))
                 continue;
-          
-            var result = await roleManager.CreateAsync( new IdentityRole(role));
 
-            if (!result.Succeeded)
-            {
-                var errors = string.Join(
+            var result =
+                await roleManager.CreateAsync(
+                    new IdentityRole(role));
+
+            if (result.Succeeded)
+                continue;
+
+            var errors =
+                string.Join(
                     ", ",
-                    result.Errors.Select(e => e.Description));
+                    result.Errors.Select(
+                        error => error.Description));
 
-                throw new InvalidOperationException(
-                    $"Failed to create role '{role}': {errors}");
-            }
+            throw new InvalidOperationException(
+                $"Failed to create role '{role}': {errors}");
         }
     }
-
 }

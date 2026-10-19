@@ -13,9 +13,12 @@ namespace AlDar.Api.Middlewares
             var (statusCode, title) = exception switch
             {
                 NotFoundException => (StatusCodes.Status404NotFound, "Not found"),
+                InvalidCredentialsException => (StatusCodes.Status401Unauthorized, "Unauthorized"),
+                EmailNotConfirmedException => (StatusCodes.Status403Forbidden, "Forbidden"),
                 ForbiddenException => (StatusCodes.Status403Forbidden, "Forbidden"),
                 ConflictException => (StatusCodes.Status409Conflict, "Conflict"),
                 ValidationException => (StatusCodes.Status400BadRequest, "Validation failed"),
+                AccountLockedException =>(StatusCodes.Status423Locked,"Account locked" ),
                 _ => (StatusCodes.Status500InternalServerError, "Unexpected error")
             };
 
@@ -35,6 +38,23 @@ namespace AlDar.Api.Middlewares
 
             if (exception is ValidationException v)
                 problem.Extensions["errors"] = v.Errors;
+            if (exception is EmailNotConfirmedException)
+            {
+                problem.Extensions["code"] =
+                    EmailNotConfirmedException.ErrorCode;
+            }
+
+            if (exception is AccountLockedException accountLockedException)
+            {
+                problem.Extensions["code"] =
+                    AccountLockedException.ErrorCode;
+
+                if (accountLockedException.LockedUntilUtc.HasValue)
+                {
+                    problem.Extensions["lockedUntilUtc"] =
+                        accountLockedException.LockedUntilUtc.Value;
+                }
+            }
 
             httpContext.Response.StatusCode = statusCode;
             await httpContext.Response.WriteAsJsonAsync(problem, ct);

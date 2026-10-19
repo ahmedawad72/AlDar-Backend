@@ -21,10 +21,25 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Testing");
 
         builder.UseSetting( 
-                "Client:BaseUrl",
-                "http://localhost:4200"
-                );
-        
+            "Client:BaseUrl",
+            "http://localhost:4200");
+
+        builder.UseSetting(
+            "Jwt:Issuer",
+            "AlDar.Api.Tests");
+
+        builder.UseSetting(
+            "Jwt:Audience",
+            "AlDar.Api.Tests");
+
+        builder.UseSetting(
+            "Jwt:ExpirationMinutes",
+            "60");
+
+        builder.UseSetting(
+            "Jwt:SigningKey",
+            "AlDar-Integration-Tests-Signing-Key-Only-Do-Not-Use-In-Production-2026!");
+
         builder.ConfigureServices(services =>
         {
             var dbContextConfigurationDescriptor = services.SingleOrDefault(

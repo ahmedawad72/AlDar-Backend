@@ -2,6 +2,7 @@
 using AlDar.Application.Authentication;
 using AlDar.Application.Exceptions;
 using AlDar.Domain.Constants;
+using AlDar.Infrastructure.Authentication;
 using AlDar.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Configuration;
@@ -17,19 +18,22 @@ public sealed class AuthService : IAuthService
     private readonly IEmailService _emailService;
     private readonly IConfiguration _configuration;
     private readonly ILogger<AuthService> _logger;
+    private readonly IJwtTokenGenerator _jwtTokenGenerator;
 
     public AuthService(
-        UserManager<AppUser> userManager,
-        AlDarDbContext dbContext,
-        IEmailService emailService,
-        IConfiguration configuration,
-        ILogger<AuthService> logger)
+     UserManager<AppUser> userManager,
+     AlDarDbContext dbContext,
+     IEmailService emailService,
+     IConfiguration configuration,
+     ILogger<AuthService> logger,
+     IJwtTokenGenerator jwtTokenGenerator)
     {
         _userManager = userManager;
         _dbContext = dbContext;
         _emailService = emailService;
         _configuration = configuration;
         _logger = logger;
+        _jwtTokenGenerator = jwtTokenGenerator;
     }
 
     public async Task<RegisterResponse> RegisterAsync(RegisterRequest request)
@@ -104,9 +108,61 @@ public sealed class AuthService : IAuthService
         return await TrySendConfirmationEmailAsync(user);
     }
 
+    public async Task<LoginResponse> LoginAsync(LoginRequest request)
+    {
+        ValidateLoginRequest(request);
 
+        var user =
+            await _userManager.FindByEmailAsync(request.Email);
 
-    
+        if (user is null)
+            throw new InvalidCredentialsException();
+
+        var passwordIsValid =
+            await _userManager.CheckPasswordAsync(user,request.Password);
+
+        if (!passwordIsValid)
+        {
+            await RecordFailedLoginAttemptAsync(user);
+
+            throw new InvalidCredentialsException();
+        }
+
+        if (await _userManager.IsLockedOutAsync(user))
+        {
+            var lockedUntil =
+                await _userManager.GetLockoutEndDateAsync(user);
+
+            throw new AccountLockedException(lockedUntil);
+        }
+
+        await ResetFailedLoginAttemptsAsync(user);
+
+        var emailIsConfirmed =
+            await _userManager.IsEmailConfirmedAsync(user);
+
+        if (!emailIsConfirmed)
+            throw new EmailNotConfirmedException();
+
+        var roles =
+            await _userManager.GetRolesAsync(user);
+
+        var roleClaims = roles.ToArray();
+
+        var token =
+            _jwtTokenGenerator.Generate(user.Id,user.Email!,roleClaims);
+
+        return new LoginResponse
+        {
+            AccessToken = token.AccessToken,
+            ExpiresAtUtc = token.ExpiresAtUtc,
+            UserId = user.Id,
+            Email = user.Email!,
+            DisplayName = user.DisplayName,
+            Roles = roleClaims
+        };
+    }
+
     // ============================= Private Methods =============================
 
     private async Task EnsureEmailIsAvailableAsync( string email)
@@ -267,8 +323,7 @@ public sealed class AuthService : IAuthService
         };
     }
 
-    private static Dictionary<string, string[]> 
-        ConvertIdentityErrors(IdentityResult result)
+    private static Dictionary<string, string[]>  ConvertIdentityErrors(IdentityResult result)
     {
         return result.Errors
             .GroupBy(error => error.Code)
@@ -289,5 +344,67 @@ public sealed class AuthService : IAuthService
                     "The email confirmation link is invalid or has expired."
                 ]
             });
+    }
+
+    private static void ValidateLoginRequest(LoginRequest request)
+    {
+        var errors =
+            new Dictionary<string, string[]>();
+
+        if (string.IsNullOrWhiteSpace(request.Email))
+        {
+            errors["Email"] =
+            [
+                "Email is required."
+            ];
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+        {
+            errors["Password"] =
+            [
+                "Password is required."
+            ];
+        }
+
+        if (errors.Count > 0)
+            throw new ValidationException(errors);
+    }
+
+    private async Task RecordFailedLoginAttemptAsync(AppUser user)
+    {
+        if (!_userManager.SupportsUserLockout)
+            return;
+
+        var lockoutEnabled =
+            await _userManager.GetLockoutEnabledAsync(user);
+
+        if (!lockoutEnabled)
+            return;
+
+        var result =
+            await _userManager.AccessFailedAsync(user);
+
+        if (!result.Succeeded)
+        {
+            _logger.LogWarning(
+                "Failed to record unsuccessful login attempt for user {UserId}",user.Id);
+        }
+    }
+
+    private async Task ResetFailedLoginAttemptsAsync(AppUser user)
+    {
+        if (!_userManager.SupportsUserLockout)
+            return;
+
+        var result =
+            await _userManager.ResetAccessFailedCountAsync(user);
+
+        if (!result.Succeeded)
+        {
+            _logger.LogWarning(
+                "Failed to reset unsuccessful login attempts for user {UserId}",
+                user.Id);
+        }
     }
 }
