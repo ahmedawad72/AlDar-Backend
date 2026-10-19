@@ -1,7 +1,8 @@
 ﻿using AlDar.Application.Authentication;
-using Azure;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-
+using System.Security.Claims;
+using System.IdentityModel.Tokens.Jwt;
 namespace AlDar.Api.Controllers;
 
 [ApiController]
@@ -52,5 +53,41 @@ public class AuthController : ControllerBase
         }
 
         return NoContent();
+    }
+
+
+    [HttpPost("login")]
+    public async Task<ActionResult<LoginResponse>> Login(LoginRequest request)
+    {
+        var response =
+            await _authService.LoginAsync(request);
+
+        return Ok(response);
+    }
+
+    [Authorize]
+    [HttpGet("me")]
+    public ActionResult<CurrentUserResponse> Me()
+    {
+        var userId =
+            User.FindFirstValue(
+                JwtRegisteredClaimNames.Sub);
+
+        var email =
+            User.FindFirstValue(
+                JwtRegisteredClaimNames.Email);
+
+        var roles =
+            User.FindAll(ClaimTypes.Role)
+                .Select(claim => claim.Value)
+                .ToArray();
+
+        return Ok(
+            new CurrentUserResponse
+            {
+                UserId = userId ?? string.Empty,
+                Email = email ?? string.Empty,
+                Roles = roles
+            });
     }
 }

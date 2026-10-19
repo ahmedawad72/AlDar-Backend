@@ -50,8 +50,7 @@ public class AuthServiceTests
 
         // Assert
         Assert.Equal(
-            "An account with this email already exists.",
-            exception.Message);
+            "An account with this email already exists.", exception.Message);
     }
 
     [Fact]
@@ -68,7 +67,6 @@ public class AuthServiceTests
         var dbContext = CreateDbContext();
 
         var authService = CreateAuthService(userManager, dbContext);
-
 
         var request = new RegisterRequest
         {
@@ -273,6 +271,7 @@ public class AuthServiceTests
         Assert.False(
             response.ConfirmationEmailSent);
     }
+
     [Fact]
     public async Task RegisterAsync_WhenRequestIsValid_ShouldCreateUserAssignRoleAndSendConfirmationEmail()
     {
@@ -513,6 +512,424 @@ public class AuthServiceTests
             Times.Never);
     }
 
+    [Fact]
+    public async Task Login_WhenUserDoesNotExist_ShouldThrowInvalidCredentialsException()
+    {
+        // Arrange
+        var userManager = CreateMockUserManager();
+
+        userManager
+            .Setup(x => x.FindByEmailAsync( "missing@test.com"))
+            .ReturnsAsync((AppUser?)null);
+
+        await using var dbContext = CreateDbContext();
+
+        var jwtTokenGenerator =
+            new Mock<IJwtTokenGenerator>();
+
+        var authService =
+            CreateAuthService(
+                userManager,
+                dbContext,
+                jwtTokenGenerator:
+                    jwtTokenGenerator);
+
+        var request =
+            new LoginRequest
+            {
+                Email = "missing@test.com",
+                Password = "Password123!"
+            };
+
+        // Act
+        var action =
+            async () =>
+                await authService.LoginAsync(request);
+
+        // Assert
+        var exception =
+            await Assert.ThrowsAsync<
+                InvalidCredentialsException>(
+                action);
+
+        Assert.Equal( "Invalid email or password.", exception.Message);
+
+        jwtTokenGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Login_WhenPasswordIsWrong_ShouldRecordFailedAttemptAndThrowInvalidCredentialsException()
+    {
+        // Arrange
+        var user =
+            new AppUser
+            {
+                Id = "user-123",
+                Email = "student@test.com",
+                DisplayName = "Student User"
+            };
+
+        var userManager = CreateMockUserManager();
+
+        userManager
+            .Setup(x => x.FindByEmailAsync( "student@test.com"))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x =>x.CheckPasswordAsync( user, "WrongPassword123!"))
+            .ReturnsAsync(false);
+
+        userManager
+            .SetupGet(x => x.SupportsUserLockout)
+            .Returns(true);
+
+        userManager
+            .Setup(x => x.GetLockoutEnabledAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.AccessFailedAsync(user))
+            .ReturnsAsync(IdentityResult.Success);
+
+        await using var dbContext = CreateDbContext();
+
+        var jwtTokenGenerator = new Mock<IJwtTokenGenerator>();
+
+        var authService =
+            CreateAuthService(
+                userManager,
+                dbContext,
+                jwtTokenGenerator:
+                    jwtTokenGenerator);
+
+        var request =
+            new LoginRequest
+            {
+                Email = "student@test.com",
+                Password = "WrongPassword123!"
+            };
+
+        // Act
+        var action =
+            async () => await authService.LoginAsync(request);
+
+        // Assert
+        var exception =
+            await Assert.
+                ThrowsAsync<InvalidCredentialsException>(action);
+
+        Assert.Equal( "Invalid email or password.",exception.Message);
+
+        userManager.Verify(
+            x => x.AccessFailedAsync(user),Times.Once);
+
+        jwtTokenGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Login_WhenEmailIsNotConfirmed_ShouldResetFailedAttemptsAndThrowEmailNotConfirmedException()
+    {
+        // Arrange
+        var user =
+            new AppUser
+            {
+                Id = "user-123",
+                Email = "student@test.com",
+                DisplayName = "Student User"
+            };
+
+        var userManager =
+            CreateMockUserManager();
+
+        userManager
+            .Setup(x => x.FindByEmailAsync("student@test.com"))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.CheckPasswordAsync(user,"Password123!"))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(false);
+
+        userManager
+            .SetupGet(x => x.SupportsUserLockout)
+            .Returns(true);
+
+        userManager
+            .Setup(x => x.ResetAccessFailedCountAsync(user))
+            .ReturnsAsync(IdentityResult.Success);
+
+        userManager
+            .Setup(x =>x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(false);
+
+        await using var dbContext = CreateDbContext();
+
+        var jwtTokenGenerator = new Mock<IJwtTokenGenerator>();
+
+        var authService =
+            CreateAuthService(
+                userManager,
+                dbContext,
+                jwtTokenGenerator:
+                    jwtTokenGenerator);
+
+        var request =
+            new LoginRequest
+            {
+                Email = "student@test.com",
+                Password = "Password123!"
+            };
+
+        // Act
+        var action =
+            async () => await authService.LoginAsync(request);
+
+        // Assert
+        var exception =
+            await Assert.
+                ThrowsAsync<EmailNotConfirmedException>(action);
+
+        Assert.Equal(
+            "Email confirmation is required before login.",exception.Message);
+
+        userManager.Verify(
+            x => x.ResetAccessFailedCountAsync(user),
+            Times.Once);
+
+        userManager.Verify(
+            x => x.GetRolesAsync(user),
+            Times.Never);
+
+        jwtTokenGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Login_WhenAccountIsLocked_ShouldThrowAccountLockedException()
+    {
+        // Arrange
+        var user =
+            new AppUser
+            {
+                Id = "user-123",
+                Email = "student@test.com",
+                DisplayName = "Student User"
+            };
+
+        var lockedUntil =
+            DateTimeOffset.UtcNow.AddMinutes(10);
+
+        var userManager = CreateMockUserManager();
+
+        userManager
+            .Setup(x => x.FindByEmailAsync( "student@test.com"))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.CheckPasswordAsync(user, "Password123!"))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.GetLockoutEndDateAsync(user))
+            .ReturnsAsync(lockedUntil);
+
+        await using var dbContext = CreateDbContext();
+
+        var jwtTokenGenerator =
+            new Mock<IJwtTokenGenerator>();
+
+        var authService =
+            CreateAuthService(
+                userManager,
+                dbContext,
+                jwtTokenGenerator:
+                    jwtTokenGenerator);
+
+        var request =
+            new LoginRequest
+            {
+                Email = "student@test.com",
+                Password = "Password123!"
+            };
+
+        // Act
+        var action =
+            async () => await authService.LoginAsync(request);
+
+        // Assert
+        var exception =
+            await Assert
+                .ThrowsAsync<AccountLockedException>(action);
+
+        Assert.Equal(
+               lockedUntil,
+               exception.LockedUntilUtc
+            );
+
+        userManager.Verify(
+            x => x.ResetAccessFailedCountAsync(user),
+            Times.Never);
+
+        userManager.Verify(
+            x => x.IsEmailConfirmedAsync(user),
+            Times.Never);
+
+        userManager.Verify(
+            x => x.GetRolesAsync(user),
+            Times.Never);
+
+        jwtTokenGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Login_WhenCredentialsAreValid_ShouldReturnLoginResponseWithToken()
+    {
+        // Arrange
+        var user =
+            new AppUser
+            {
+                Id = "user-123",
+                Email = "student@test.com",
+                DisplayName = "Student User"
+            };
+
+        var roles = new List<string>{
+            Roles.Student
+        };
+
+        var userManager = CreateMockUserManager();
+
+        userManager
+            .Setup(x => x.FindByEmailAsync( "student@test.com"))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.CheckPasswordAsync(user, "Password123!"))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(false);
+
+        userManager
+            .SetupGet(x => x.SupportsUserLockout)
+            .Returns(true);
+
+        userManager
+            .Setup(x => x.ResetAccessFailedCountAsync(user))
+            .ReturnsAsync(IdentityResult.Success);
+
+        userManager
+            .Setup(x => x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.GetRolesAsync(user))
+            .ReturnsAsync(roles);
+
+        await using var dbContext = CreateDbContext();
+
+        var jwtTokenGenerator =
+            new Mock<IJwtTokenGenerator>();
+
+        var expiresAt =
+            DateTimeOffset.UtcNow.AddHours(1);
+
+        jwtTokenGenerator
+            .Setup(x =>
+                x.Generate(
+                    "user-123",
+                    "student@test.com",
+                    It.Is<IReadOnlyCollection<string>>(
+                        x => x.Contains(Roles.Student))))
+            .Returns(
+                new JwtTokenResult(
+                    "fake-jwt-token",
+                    expiresAt));
+
+        var authService =
+            CreateAuthService(
+                userManager,
+                dbContext,
+                jwtTokenGenerator:
+                    jwtTokenGenerator);
+
+        var request =
+            new LoginRequest
+            {
+                Email = "student@test.com",
+                Password = "Password123!"
+            };
+
+        // Act
+        var response =
+            await authService.LoginAsync(request);
+
+        // Assert
+        Assert.Equal(
+            "fake-jwt-token",
+            response.AccessToken);
+
+        Assert.Equal(
+            expiresAt,
+            response.ExpiresAtUtc);
+
+        Assert.Equal(
+            "user-123",
+            response.UserId);
+
+        Assert.Equal(
+            "student@test.com",
+            response.Email);
+
+        Assert.Equal(
+            "Student User",
+            response.DisplayName);
+
+        Assert.Contains(
+            Roles.Student,
+            response.Roles);
+
+        userManager.Verify(
+            x => x.ResetAccessFailedCountAsync(user),
+            Times.Once);
+
+        jwtTokenGenerator.Verify(
+            x => x.Generate(
+                "user-123",
+                "student@test.com",
+                It.Is<IReadOnlyCollection<string>>(
+                    roles =>
+                        roles.Contains(
+                            Roles.Student))),
+            Times.Once);
+    }
     // ============================= private helper methods ===============================
     private static Mock<UserManager<AppUser>> CreateMockUserManager()
     {
@@ -545,11 +962,16 @@ public class AuthServiceTests
     }
 
     private static AuthService CreateAuthService(
-    Mock<UserManager<AppUser>> userManager,
-    AlDarDbContext dbContext,
-    Mock<IEmailService>? emailService = null)
+      Mock<UserManager<AppUser>> userManager,
+      AlDarDbContext dbContext,
+      Mock<IEmailService>? emailService = null,
+      Mock<IJwtTokenGenerator>? jwtTokenGenerator = null)
     {
-        emailService ??= new Mock<IEmailService>();
+        emailService ??=
+            new Mock<IEmailService>();
+
+        jwtTokenGenerator ??=
+            new Mock<IJwtTokenGenerator>();
 
         var configuration =
             new ConfigurationBuilder()
@@ -569,6 +991,8 @@ public class AuthServiceTests
             dbContext,
             emailService.Object,
             configuration,
-            logger);
+            logger,
+            jwtTokenGenerator.Object);
     }
+
 }

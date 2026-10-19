@@ -38,6 +38,7 @@ app.UseHttpsRedirection();
 
 app.UseCors("AlDarClient");
 
+app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
