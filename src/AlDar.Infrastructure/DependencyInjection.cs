@@ -18,9 +18,7 @@ namespace AlDar.Infrastructure;
 
 public static class DependencyInjection
 {
-    public static IServiceCollection AddInfrastructure(
-        this IServiceCollection services,
-        IConfiguration config)
+    public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration config)
     {
         // Database
         services.AddDbContext<AlDarDbContext>(options =>
@@ -66,6 +64,21 @@ public static class DependencyInjection
         ValidateJwtOptions(jwtOptions);
 
         services.AddSingleton<IJwtTokenGenerator,JwtTokenGenerator>();
+
+
+        // Refresh Token configuration
+        services.AddSingleton(TimeProvider.System);
+
+        services.AddOptions<RefreshSessionOptions>()
+                .Bind(config.GetSection(RefreshSessionOptions.SectionName))
+                .Validate(
+                    options =>
+                        options.TokenLifetimeDays > 0 &&
+                        options.MaxSessionLifetimeDays >= options.TokenLifetimeDays,
+                    "Invalid refresh-session expiration configuration.")
+                .ValidateOnStart();
+
+        services.AddScoped<IRefreshSessionIssuer, RefreshSessionIssuer>();
 
         // Authentication
         services

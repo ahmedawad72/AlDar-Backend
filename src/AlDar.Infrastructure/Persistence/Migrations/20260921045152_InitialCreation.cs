@@ -3,7 +3,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
-namespace AlDar.Infrastructure.Migrations
+namespace AlDar.Infrastructure.Persistence.Migrations
 {
     /// <inheritdoc />
     public partial class InitialCreation : Migration
