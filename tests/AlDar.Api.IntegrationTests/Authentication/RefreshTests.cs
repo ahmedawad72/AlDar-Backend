@@ -1,0 +1,373 @@
+﻿
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using AlDar.Infrastructure.Authentication;
+using AlDar.Infrastructure.Identity;
+using AlDar.Infrastructure.Persistence;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Xunit;
+
+namespace AlDar.Api.IntegrationTests.Authentication;
+
+public sealed class RefreshTests
+    : IClassFixture<CustomWebApplicationFactory>, IDisposable
+{
+    private readonly CustomWebApplicationFactory _factory;
+    private readonly HttpClient _client;
+
+    public RefreshTests(CustomWebApplicationFactory factory)
+    {
+        _factory = factory;
+
+        // We control cookies explicitly in each request.
+        _client = factory.CreateClient(
+            new WebApplicationFactoryClientOptions
+            {
+                BaseAddress = new Uri("https://localhost"),
+                HandleCookies = false,
+                AllowAutoRedirect = false
+            });
+    }
+
+    [Fact]
+    public async Task Refresh_WithValidCookie_ShouldRotateTokenAndReturnNewJwt()
+    {
+        // Arrange: create a confirmed student and log in.
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+
+        var originalToken = GetRefreshToken(loginResponse);
+
+        // Act
+        using var refreshResponse =
+            await PostRefreshAsync(originalToken);
+
+        // Assert: HTTP response
+        Assert.Equal(HttpStatusCode.OK, refreshResponse.StatusCode);
+
+        var replacementToken = GetRefreshToken(refreshResponse);
+
+        Assert.NotEqual(originalToken, replacementToken);
+
+        var setCookie = GetRefreshCookieHeader(refreshResponse);
+
+        Assert.True(setCookie.Contains(
+            "httponly", StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(setCookie.Contains(
+            "secure", StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(setCookie.Contains(
+            "samesite=strict", StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(setCookie.Contains(
+            "path=/api/auth", StringComparison.OrdinalIgnoreCase));
+
+        // Assert: JSON contains the JWT but not the refresh token.
+        var json = await refreshResponse.Content.ReadAsStringAsync();
+
+        using var document = JsonDocument.Parse(json);
+
+        var root = document.RootElement;
+
+        Assert.False(string.IsNullOrWhiteSpace(
+            root.GetProperty("accessToken").GetString()));
+
+        Assert.Equal(
+            user.UserId,
+            root.GetProperty("userId").GetString());
+
+        Assert.Equal(
+            user.Email,
+            root.GetProperty("email").GetString());
+
+        Assert.False(root.TryGetProperty("refreshToken", out _));
+        Assert.False(root.TryGetProperty("refreshSession", out _));
+        Assert.False(root.TryGetProperty("rawToken", out _));
+
+        Assert.DoesNotContain(replacementToken, json);
+
+        // Assert: database contains both records and only hashes.
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+        var sessions = await dbContext.RefreshTokens
+            .AsNoTracking()
+            .Where(x => x.UserId == user.UserId)
+            .ToListAsync();
+
+        Assert.Equal(2, sessions.Count);
+
+        var oldSession = Assert.Single(
+            sessions,
+            x => x.TokenHash ==
+                RefreshTokenSecurity.HashToken(originalToken));
+
+        var newSession = Assert.Single(
+            sessions,
+            x => x.TokenHash ==
+                RefreshTokenSecurity.HashToken(replacementToken));
+
+        Assert.NotNull(oldSession.ConsumedAtUtc);
+        Assert.Null(newSession.ConsumedAtUtc);
+        Assert.Null(newSession.RevokedAtUtc);
+
+        Assert.Equal(oldSession.FamilyId, newSession.FamilyId);
+
+        Assert.Equal(
+            oldSession.AbsoluteExpiresAtUtc,
+            newSession.AbsoluteExpiresAtUtc);
+
+        Assert.NotEqual(replacementToken, newSession.TokenHash);
+    }
+
+    [Fact]
+    public async Task Refresh_WithoutCookie_ShouldReturnUnauthorized()
+    {
+        // Act
+        using var response =
+            await _client.PostAsync("/api/auth/refresh", null);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+    }
+
+    [Fact]
+    public async Task Refresh_WithInvalidCookie_ShouldReturnUnauthorized()
+    {
+        // Act
+        using var response =
+            await PostRefreshAsync("invalid-refresh-token");
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        Assert.False(response.Headers.Contains("Set-Cookie"));
+    }
+
+    [Fact]
+    public async Task Refresh_WithExpiredToken_ShouldReturnUnauthorized()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+
+        var rawToken = GetRefreshToken(loginResponse);
+
+        // Expire the session directly in the test database.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext =
+                scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+            var session = await dbContext.RefreshTokens.SingleAsync(
+                x => x.TokenHash ==
+                    RefreshTokenSecurity.HashToken(rawToken));
+
+            session.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-1);
+
+            await dbContext.SaveChangesAsync();
+        }
+
+        // Act
+        using var response = await PostRefreshAsync(rawToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        using var verificationScope = _factory.Services.CreateScope();
+
+        var verificationDb =
+            verificationScope.ServiceProvider
+                .GetRequiredService<AlDarDbContext>();
+
+        var sessionCount = await verificationDb.RefreshTokens
+            .CountAsync(x => x.UserId == user.UserId);
+
+        // No replacement should have been created.
+        Assert.Equal(1, sessionCount);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenOldTokenIsReused_ShouldRejectReplay()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+
+        var originalToken = GetRefreshToken(loginResponse);
+
+        // First refresh succeeds.
+        using var firstRefresh =
+            await PostRefreshAsync(originalToken);
+
+        Assert.Equal(HttpStatusCode.OK, firstRefresh.StatusCode);
+
+        var replacementToken = GetRefreshToken(firstRefresh);
+
+        // Act: attempt to reuse the consumed token.
+        using var replayResponse =
+            await PostRefreshAsync(originalToken);
+
+        // Assert: replay is rejected.
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            replayResponse.StatusCode);
+
+        // Our current replay policy revokes the session family.
+        using var nextResponse =
+            await PostRefreshAsync(replacementToken);
+
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            nextResponse.StatusCode);
+
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+        var sessions = await dbContext.RefreshTokens
+            .AsNoTracking()
+            .Where(x => x.UserId == user.UserId)
+            .ToListAsync();
+
+        Assert.Equal(2, sessions.Count);
+
+        Assert.All(
+            sessions,
+            session => Assert.NotNull(session.RevokedAtUtc));
+    }
+
+    // ------------------------------------------------------
+    // Test helpers
+    // ------------------------------------------------------
+
+    private async Task<(string UserId, string Email, string Password)>
+        CreateConfirmedStudentAsync()
+    {
+        using var scope = _factory.Services.CreateScope();
+
+        var userManager =
+            scope.ServiceProvider.GetRequiredService<UserManager<AppUser>>();
+
+        var roleManager =
+            scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole>>();
+
+        const string password = "Password123!";
+
+        var email = $"refresh-{Guid.NewGuid():N}@test.com";
+
+        var user = new AppUser
+        {
+            UserName = email,
+            Email = email,
+            DisplayName = "Refresh Test Student",
+            EmailConfirmed = true
+        };
+
+        var createResult = await userManager.CreateAsync(user, password);
+
+        Assert.True(
+            createResult.Succeeded,
+            string.Join(", ", createResult.Errors.Select(x => x.Description)));
+
+        // Create the test role only if it has not been seeded.
+        if (!await roleManager.RoleExistsAsync("Student"))
+        {
+            var roleResult =
+                await roleManager.CreateAsync(new IdentityRole("Student"));
+
+            Assert.True(roleResult.Succeeded);
+        }
+
+        var addRoleResult =
+            await userManager.AddToRoleAsync(user, "Student");
+
+        Assert.True(addRoleResult.Succeeded);
+
+        return (user.Id, email, password);
+    }
+
+    private Task<HttpResponseMessage> LoginAsync(
+        string email,
+        string password)
+    {
+        return _client.PostAsJsonAsync(
+            "/api/auth/login",
+            new
+            {
+                Email = email,
+                Password = password
+            });
+    }
+
+    private async Task<HttpResponseMessage> PostRefreshAsync(
+        string rawToken)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "/api/auth/refresh");
+
+        request.Headers.TryAddWithoutValidation(
+            "Cookie",
+            $"aldar.refresh={rawToken}");
+
+        return await _client.SendAsync(request);
+    }
+
+    private static string GetRefreshCookieHeader(
+        HttpResponseMessage response)
+    {
+        Assert.True(
+            response.Headers.TryGetValues(
+                "Set-Cookie",
+                out var cookieHeaders));
+
+        return Assert.Single(
+            cookieHeaders!,
+            cookie => cookie.StartsWith(
+                "aldar.refresh=",
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string GetRefreshToken(
+        HttpResponseMessage response)
+    {
+        var header = GetRefreshCookieHeader(response);
+
+        var cookiePair = header.Split(';', 2)[0];
+
+        var rawToken =
+            cookiePair["aldar.refresh=".Length..];
+
+        Assert.False(string.IsNullOrWhiteSpace(rawToken));
+
+        return rawToken;
+    }
+
+    public void Dispose()
+    {
+        _client.Dispose();
+    }
+}

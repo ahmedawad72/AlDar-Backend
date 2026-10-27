@@ -1,6 +1,5 @@
 ﻿using AlDar.Application.Authentication;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -78,6 +77,44 @@ public class AuthController : ControllerBase
         return Ok(result.Response);
     }
 
+    [HttpPost("refresh")]
+    [AllowAnonymous]
+    public async Task<ActionResult<LoginResponse>> Refresh(
+    CancellationToken cancellationToken)
+    {
+        // 1. Read the refresh token from the HttpOnly cookie.
+        if (!Request.Cookies.TryGetValue(
+                "aldar.refresh", out var rawToken))
+        {
+            return Unauthorized();
+        }
+
+        // 2. Validate the user and rotate the refresh session.
+        var result = await _authService.RefreshAsync(
+            rawToken,
+            cancellationToken);
+
+        if (result is null)
+            return Unauthorized();
+
+        // 3. Replace the browser's refresh cookie.
+        Response.Cookies.Append(
+            "aldar.refresh",
+            result.RefreshSession.RawToken,
+            new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = true,
+                SameSite = SameSiteMode.Strict,
+                Path = "/api/auth",
+                Expires = new DateTimeOffset(
+                    result.RefreshSession.ExpiresAtUtc,
+                    TimeSpan.Zero)
+            });
+
+        // 4. Return only the JWT and current user information.
+        return Ok(result.Response);
+    }
     [Authorize]
     [HttpGet("me")]
     public ActionResult<CurrentUserResponse> Me()
