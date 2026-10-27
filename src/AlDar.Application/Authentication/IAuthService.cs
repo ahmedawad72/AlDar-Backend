@@ -6,4 +6,5 @@ public interface IAuthService
     Task ConfirmEmailAsync( ConfirmEmailRequest request);
     Task<bool> ResendConfirmationEmailAsync(ResendConfirmationEmailRequest request);
     Task<AuthenticationResult> LoginAsync( LoginRequest request);
+    Task<AuthenticationResult?> RefreshAsync(string rawToken,CancellationToken cancellationToken = default);
 }

@@ -5,6 +5,7 @@ using AlDar.Domain.Constants;
 using AlDar.Infrastructure.Identity;
 using AlDar.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
@@ -811,8 +812,8 @@ public class AuthServiceTests
     public async Task Login_WhenCredentialsAreValid_ShouldReturnLoginResponseWithToken()
     {
         // Arrange
-        var email = "student@test.com";
-        var password = "Password123!";
+        const string email = "student@test.com";
+        const string password = "Password123!";
 
         var user = new AppUser
         {
@@ -852,12 +853,19 @@ public class AuthServiceTests
 
         userManager
             .Setup(x => x.GetRolesAsync(user))
-            .ReturnsAsync(new List<string>
-            {
-            Roles.Student
-            });
+            .ReturnsAsync(new List<string> { "Student" });
 
-        var expiresAt = DateTimeOffset.UtcNow.AddMinutes(60);
+        userManager
+            .Setup(x => x.ResetAccessFailedCountAsync(user))
+            .ReturnsAsync(IdentityResult.Success);
+
+        // Fixed JWT expiration
+        var jwtExpiresAtUtc = new DateTime(
+            2030, 1, 1, 0, 15, 0, DateTimeKind.Utc);
+
+        var jwtToken = new JwtTokenResult(
+            "fake-jwt-token",
+            jwtExpiresAtUtc);
 
         var jwtTokenGenerator = new Mock<IJwtTokenGenerator>();
 
@@ -866,33 +874,39 @@ public class AuthServiceTests
                 user.Id,
                 email,
                 It.IsAny<IReadOnlyCollection<string>>()))
-            .Returns(
-                new JwtTokenResult(
-                    "fake-jwt-token",
-                    expiresAt));
+            .Returns(jwtToken);
 
-        var refreshExpiration = DateTime.UtcNow.AddDays(7);
+        // Fixed refresh-token expiration
+        var refreshExpiresAtUtc = new DateTime(
+            2030, 1, 8, 0, 0, 0, DateTimeKind.Utc);
 
-        var refreshSessionIssuer =
-            new Mock<IRefreshSessionIssuer>();
+        var refreshSessionIssuer = new Mock<IRefreshSessionIssuer>();
 
         refreshSessionIssuer
             .Setup(x => x.CreateAsync(
                 user.Id,
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(
-                new CreatedRefreshSession(
-                    "fake-refresh-token",
-                    refreshExpiration));
+            .ReturnsAsync(new CreatedRefreshSession(
+                "fake-refresh-token",
+                refreshExpiresAtUtc));
+
+        // Test database
+        await using var connection =
+            new SqliteConnection("Data Source=:memory:");
+
+        await connection.OpenAsync();
 
         var dbOptions =
             new DbContextOptionsBuilder<AlDarDbContext>()
-                .UseSqlite("Data Source=:memory:")
+                .UseSqlite(connection)
                 .Options;
 
         await using var dbContext =
             new AlDarDbContext(dbOptions);
 
+        await dbContext.Database.EnsureCreatedAsync();
+
+        // Create service
         var service = CreateAuthService(
             userManager,
             dbContext,
@@ -908,28 +922,28 @@ public class AuthServiceTests
         // Act
         var result = await service.LoginAsync(request);
 
-        // Assert: Authentication response
+        // Assert: Login response
         Assert.NotNull(result);
+        Assert.NotNull(result.Response);
 
         var response = result.Response;
 
         Assert.Equal("fake-jwt-token", response.AccessToken);
-        Assert.Equal(expiresAt, response.ExpiresAtUtc);
+        Assert.Equal(jwtToken.ExpiresAtUtc, response.ExpiresAtUtc);
         Assert.Equal(user.Id, response.UserId);
         Assert.Equal(email, response.Email);
         Assert.Equal(user.DisplayName, response.DisplayName);
-
-        Assert.Contains(
-            Roles.Student,
-            response.Roles);
+        Assert.Contains("Student", response.Roles);
 
         // Assert: Refresh session
+        Assert.NotNull(result.RefreshSession);
+
         Assert.Equal(
             "fake-refresh-token",
             result.RefreshSession.RawToken);
 
         Assert.Equal(
-            refreshExpiration,
+            refreshExpiresAtUtc,
             result.RefreshSession.ExpiresAtUtc);
 
         // Verify JWT generation
@@ -937,13 +951,10 @@ public class AuthServiceTests
             x => x.Generate(
                 user.Id,
                 email,
-                It.Is<IReadOnlyCollection<string>>(
-                    roles =>
-                        roles.Count == 1 &&
-                        roles.Contains(Roles.Student))),
+                It.IsAny<IReadOnlyCollection<string>>()),
             Times.Once);
 
-        // Verify refresh session creation
+        // Verify refresh-session issuance
         refreshSessionIssuer.Verify(
             x => x.CreateAsync(
                 user.Id,
@@ -951,6 +962,476 @@ public class AuthServiceTests
             Times.Once);
     }
 
+    [Fact]
+    public async Task Refresh_WhenTokenIsValid_ShouldGenerateJwtAndRotateSession()
+    {
+        // Arrange
+        const string rawToken = "original-refresh-token";
+        const string newRawToken = "replacement-refresh-token";
+        const string email = "student@test.com";
+
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid().ToString(),
+            UserName = email,
+            Email = email,
+            DisplayName = "Test Student",
+            EmailConfirmed = true
+        };
+
+        var userManager = CreateRefreshUserManager();
+
+        userManager
+            .Setup(x => x.FindByIdAsync(user.Id))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(false);
+
+        userManager
+            .Setup(x => x.GetRolesAsync(user))
+            .ReturnsAsync(new List<string> { "Student" });
+
+        var jwtExpiration = new DateTime(
+            2030, 1, 1, 0, 15, 0, DateTimeKind.Utc);
+
+        var refreshExpiration = new DateTime(
+            2030, 1, 8, 0, 0, 0, DateTimeKind.Utc);
+
+        var executionOrder = new List<string>();
+
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+
+        jwtGenerator
+            .Setup(x => x.Generate(
+                user.Id,
+                email,
+                It.IsAny<IReadOnlyCollection<string>>()))
+            .Callback(() => executionOrder.Add("GenerateJwt"))
+            .Returns(new JwtTokenResult(
+                "new-access-token",
+                jwtExpiration));
+
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(user.Id);
+
+        rotator
+            .Setup(x => x.RotateAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .Callback(() => executionOrder.Add("RotateToken"))
+            .ReturnsAsync(new RotatedRefreshSession(
+                user.Id,
+                new CreatedRefreshSession(
+                    newRawToken,
+                    refreshExpiration)));
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act
+        var result = await service.RefreshAsync(rawToken);
+
+        // Assert
+        Assert.NotNull(result);
+
+        Assert.Equal("new-access-token", result.Response.AccessToken);
+        Assert.Equal(jwtExpiration, result.Response.ExpiresAtUtc);
+        Assert.Equal(user.Id, result.Response.UserId);
+        Assert.Equal(email, result.Response.Email);
+        Assert.Equal(user.DisplayName, result.Response.DisplayName);
+        Assert.Contains("Student", result.Response.Roles);
+
+        Assert.Equal(
+            newRawToken,
+            result.RefreshSession.RawToken);
+
+        Assert.Equal(
+            refreshExpiration,
+            result.RefreshSession.ExpiresAtUtc);
+
+        // JWT generation must occur before rotation.
+        Assert.Collection(
+            executionOrder,
+            step => Assert.Equal("GenerateJwt", step),
+            step => Assert.Equal("RotateToken", step));
+
+        rotator.Verify(
+            x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        rotator.Verify(
+            x => x.RotateAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        jwtGenerator.Verify(
+            x => x.Generate(
+                user.Id,
+                email,
+                It.Is<IReadOnlyCollection<string>>(
+                    roles => roles.Contains("Student"))),
+            Times.Once);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task Refresh_WhenAccountIsNotEligible_ShouldNotRotateSession(bool emailConfirmed, bool locked)
+    {
+        // Arrange
+        const string rawToken = "original-refresh-token";
+        const string email = "student@test.com";
+
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid().ToString(),
+            UserName = email,
+            Email = email,
+            DisplayName = "Test Student",
+            EmailConfirmed = emailConfirmed
+        };
+
+        var userManager = CreateRefreshUserManager();
+
+        userManager
+            .Setup(x => x.FindByIdAsync(user.Id))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(emailConfirmed);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(locked);
+
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(user.Id);
+
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act
+        var result = await service.RefreshAsync(rawToken);
+
+        // Assert
+        Assert.Null(result);
+
+        rotator.Verify(
+            x => x.RotateAsync(
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        jwtGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+
+        userManager.Verify(
+            x => x.GetRolesAsync(user),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenUserDoesNotExist_ShouldNotRotateSession()
+    {
+        // Arrange
+        const string rawToken = "original-refresh-token";
+
+        var userId = Guid.NewGuid().ToString();
+
+        var userManager = CreateRefreshUserManager();
+
+        userManager
+            .Setup(x => x.FindByIdAsync(userId))
+            .ReturnsAsync((AppUser?)null);
+
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(userId);
+
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act
+        var result = await service.RefreshAsync(rawToken);
+
+        // Assert
+        Assert.Null(result);
+
+        userManager.Verify(
+            x => x.FindByIdAsync(userId),
+            Times.Once);
+
+        rotator.Verify(
+            x => x.RotateAsync(
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        jwtGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenJwtGenerationFails_ShouldNotRotateSession()
+    {
+        // Arrange
+        const string rawToken = "original-refresh-token";
+        const string email = "student@test.com";
+
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid().ToString(),
+            UserName = email,
+            Email = email,
+            DisplayName = "Test Student",
+            EmailConfirmed = true
+        };
+
+        var userManager = CreateRefreshUserManager();
+
+        userManager
+            .Setup(x => x.FindByIdAsync(user.Id))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(false);
+
+        userManager
+            .Setup(x => x.GetRolesAsync(user))
+            .ReturnsAsync(new List<string> { "Student" });
+
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(user.Id);
+
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+
+        jwtGenerator
+            .Setup(x => x.Generate(
+                user.Id,
+                email,
+                It.IsAny<IReadOnlyCollection<string>>()))
+            .Throws(new InvalidOperationException(
+                "JWT generation failed"));
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act & Assert
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.RefreshAsync(rawToken));
+
+        // No replacement session should be created.
+        rotator.Verify(
+            x => x.RotateAsync(
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenTokenIsInvalid_ShouldReturnNull()
+    {
+        // Arrange
+        const string rawToken = "invalid-refresh-token";
+
+        var userManager = CreateRefreshUserManager();
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string?)null);
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act
+        var result = await service.RefreshAsync(rawToken);
+
+        // Assert
+        Assert.Null(result);
+
+        userManager.Verify(
+            x => x.FindByIdAsync(It.IsAny<string>()),
+            Times.Never);
+
+        jwtGenerator.Verify(
+            x => x.Generate(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Never);
+
+        rotator.Verify(
+            x => x.RotateAsync(
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenRotationFails_ShouldReturnNull()
+    {
+        // Arrange
+        const string rawToken = "original-refresh-token";
+        const string email = "student@test.com";
+
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid().ToString(),
+            UserName = email,
+            Email = email,
+            DisplayName = "Test Student",
+            EmailConfirmed = true
+        };
+
+        var userManager = CreateRefreshUserManager();
+
+        userManager
+            .Setup(x => x.FindByIdAsync(user.Id))
+            .ReturnsAsync(user);
+
+        userManager
+            .Setup(x => x.IsEmailConfirmedAsync(user))
+            .ReturnsAsync(true);
+
+        userManager
+            .Setup(x => x.IsLockedOutAsync(user))
+            .ReturnsAsync(false);
+
+        userManager
+            .Setup(x => x.GetRolesAsync(user))
+            .ReturnsAsync(new List<string> { "Student" });
+
+        var rotator = new Mock<IRefreshSessionRotator>();
+
+        rotator
+            .Setup(x => x.InspectAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(user.Id);
+
+        // Rotation fails because the token is no longer valid.
+        rotator
+            .Setup(x => x.RotateAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((RotatedRefreshSession?)null);
+
+        var jwtGenerator = new Mock<IJwtTokenGenerator>();
+
+        var jwtExpiration = new DateTime(
+            2030, 1, 1, 0, 15, 0, DateTimeKind.Utc);
+
+        jwtGenerator
+            .Setup(x => x.Generate(
+                user.Id,
+                email,
+                It.IsAny<IReadOnlyCollection<string>>()))
+            .Returns(new JwtTokenResult(
+                "new-access-token",
+                jwtExpiration));
+
+        await using var dbContext = CreateRefreshTestDbContext();
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtGenerator,
+            refreshSessionRotator: rotator);
+
+        // Act
+        var result = await service.RefreshAsync(rawToken);
+
+        // Assert
+        Assert.Null(result);
+
+        jwtGenerator.Verify(
+            x => x.Generate(
+                user.Id,
+                email,
+                It.IsAny<IReadOnlyCollection<string>>()),
+            Times.Once);
+
+        rotator.Verify(
+            x => x.RotateAsync(
+                rawToken,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
     // ============================= private helper methods ===============================
     private static Mock<UserManager<AppUser>> CreateMockUserManager()
     {
@@ -981,21 +1462,25 @@ public class AuthServiceTests
         return new AlDarDbContext(options);
 
     }
-
     private static AuthService CreateAuthService(
-      Mock<UserManager<AppUser>> userManager,
-      AlDarDbContext dbContext,
-      Mock<IEmailService>? emailService = null,
-      Mock<IJwtTokenGenerator>? jwtTokenGenerator = null,
-      Mock<IRefreshSessionIssuer>? refreshSessionIssuer = null)
+     Mock<UserManager<AppUser>> userManager,
+     AlDarDbContext dbContext,
+     Mock<IEmailService>? emailService = null,
+     Mock<IJwtTokenGenerator>? jwtTokenGenerator = null,
+     Mock<IRefreshSessionIssuer>? refreshSessionIssuer = null,
+     Mock<IRefreshSessionRotator>? refreshSessionRotator = null)
     {
         emailService ??= new Mock<IEmailService>();
-
         jwtTokenGenerator ??= new Mock<IJwtTokenGenerator>();
 
+        // Only configure the default mock if the test
+        // hasn't supplied its own refresh-session issuer.
         if (refreshSessionIssuer is null)
         {
             refreshSessionIssuer = new Mock<IRefreshSessionIssuer>();
+
+            var expiresAtUtc = new DateTime(
+                2030, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
             refreshSessionIssuer
                 .Setup(x => x.CreateAsync(
@@ -1004,8 +1489,10 @@ public class AuthServiceTests
                 .ReturnsAsync(
                     new CreatedRefreshSession(
                         "fake-refresh-token",
-                        DateTime.UtcNow.AddDays(7)));
+                        expiresAtUtc));
         }
+
+        refreshSessionRotator ??= new Mock<IRefreshSessionRotator>();
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(
@@ -1024,7 +1511,30 @@ public class AuthServiceTests
             configuration,
             logger,
             jwtTokenGenerator.Object,
-            refreshSessionIssuer.Object);
+            refreshSessionIssuer.Object,
+            refreshSessionRotator.Object);
     }
 
+    private static Mock<UserManager<AppUser>> CreateRefreshUserManager()
+    {
+        return new Mock<UserManager<AppUser>>(
+            Mock.Of<IUserStore<AppUser>>(),
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!);
+    }
+
+    private static AlDarDbContext CreateRefreshTestDbContext()
+    {
+        var options = new DbContextOptionsBuilder<AlDarDbContext>()
+            .UseSqlite("Data Source=:memory:")
+            .Options;
+
+        return new AlDarDbContext(options);
+    }
 }

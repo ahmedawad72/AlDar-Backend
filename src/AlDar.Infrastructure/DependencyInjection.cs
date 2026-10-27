@@ -80,6 +80,9 @@ public static class DependencyInjection
 
         services.AddScoped<IRefreshSessionIssuer, RefreshSessionIssuer>();
 
+        services.AddScoped<IRefreshSessionRotator,RefreshSessionRotator>();
+
+
         // Authentication
         services
             .AddAuthentication(options =>
