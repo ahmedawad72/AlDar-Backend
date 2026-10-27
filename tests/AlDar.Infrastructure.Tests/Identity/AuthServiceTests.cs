@@ -811,26 +811,35 @@ public class AuthServiceTests
     public async Task Login_WhenCredentialsAreValid_ShouldReturnLoginResponseWithToken()
     {
         // Arrange
-        var user =
-            new AppUser
-            {
-                Id = "user-123",
-                Email = "student@test.com",
-                DisplayName = "Student User"
-            };
+        var email = "student@test.com";
+        var password = "Password123!";
 
-        var roles = new List<string>{
-            Roles.Student
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid().ToString(),
+            Email = email,
+            UserName = email,
+            DisplayName = "Test Student",
+            EmailConfirmed = true
         };
 
-        var userManager = CreateMockUserManager();
+        var userManager = new Mock<UserManager<AppUser>>(
+            Mock.Of<IUserStore<AppUser>>(),
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!);
 
         userManager
-            .Setup(x => x.FindByEmailAsync( "student@test.com"))
+            .Setup(x => x.FindByEmailAsync(email))
             .ReturnsAsync(user);
 
         userManager
-            .Setup(x => x.CheckPasswordAsync(user, "Password123!"))
+            .Setup(x => x.CheckPasswordAsync(user, password))
             .ReturnsAsync(true);
 
         userManager
@@ -838,98 +847,110 @@ public class AuthServiceTests
             .ReturnsAsync(false);
 
         userManager
-            .SetupGet(x => x.SupportsUserLockout)
-            .Returns(true);
-
-        userManager
-            .Setup(x => x.ResetAccessFailedCountAsync(user))
-            .ReturnsAsync(IdentityResult.Success);
-
-        userManager
             .Setup(x => x.IsEmailConfirmedAsync(user))
             .ReturnsAsync(true);
 
         userManager
             .Setup(x => x.GetRolesAsync(user))
-            .ReturnsAsync(roles);
+            .ReturnsAsync(new List<string>
+            {
+            Roles.Student
+            });
 
-        await using var dbContext = CreateDbContext();
+        var expiresAt = DateTimeOffset.UtcNow.AddMinutes(60);
 
-        var jwtTokenGenerator =
-            new Mock<IJwtTokenGenerator>();
-
-        var expiresAt =
-            DateTimeOffset.UtcNow.AddHours(1);
+        var jwtTokenGenerator = new Mock<IJwtTokenGenerator>();
 
         jwtTokenGenerator
-            .Setup(x =>
-                x.Generate(
-                    "user-123",
-                    "student@test.com",
-                    It.Is<IReadOnlyCollection<string>>(
-                        x => x.Contains(Roles.Student))))
+            .Setup(x => x.Generate(
+                user.Id,
+                email,
+                It.IsAny<IReadOnlyCollection<string>>()))
             .Returns(
                 new JwtTokenResult(
                     "fake-jwt-token",
                     expiresAt));
 
-        var authService =
-            CreateAuthService(
-                userManager,
-                dbContext,
-                jwtTokenGenerator:
-                    jwtTokenGenerator);
+        var refreshExpiration = DateTime.UtcNow.AddDays(7);
 
-        var request =
-            new LoginRequest
-            {
-                Email = "student@test.com",
-                Password = "Password123!"
-            };
+        var refreshSessionIssuer =
+            new Mock<IRefreshSessionIssuer>();
+
+        refreshSessionIssuer
+            .Setup(x => x.CreateAsync(
+                user.Id,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(
+                new CreatedRefreshSession(
+                    "fake-refresh-token",
+                    refreshExpiration));
+
+        var dbOptions =
+            new DbContextOptionsBuilder<AlDarDbContext>()
+                .UseSqlite("Data Source=:memory:")
+                .Options;
+
+        await using var dbContext =
+            new AlDarDbContext(dbOptions);
+
+        var service = CreateAuthService(
+            userManager,
+            dbContext,
+            jwtTokenGenerator: jwtTokenGenerator,
+            refreshSessionIssuer: refreshSessionIssuer);
+
+        var request = new LoginRequest
+        {
+            Email = email,
+            Password = password
+        };
 
         // Act
-        var response =
-            await authService.LoginAsync(request);
+        var result = await service.LoginAsync(request);
 
-        // Assert
-        Assert.Equal(
-            "fake-jwt-token",
-            response.AccessToken);
+        // Assert: Authentication response
+        Assert.NotNull(result);
 
-        Assert.Equal(
-            expiresAt,
-            response.ExpiresAtUtc);
+        var response = result.Response;
 
-        Assert.Equal(
-            "user-123",
-            response.UserId);
-
-        Assert.Equal(
-            "student@test.com",
-            response.Email);
-
-        Assert.Equal(
-            "Student User",
-            response.DisplayName);
+        Assert.Equal("fake-jwt-token", response.AccessToken);
+        Assert.Equal(expiresAt, response.ExpiresAtUtc);
+        Assert.Equal(user.Id, response.UserId);
+        Assert.Equal(email, response.Email);
+        Assert.Equal(user.DisplayName, response.DisplayName);
 
         Assert.Contains(
             Roles.Student,
             response.Roles);
 
-        userManager.Verify(
-            x => x.ResetAccessFailedCountAsync(user),
-            Times.Once);
+        // Assert: Refresh session
+        Assert.Equal(
+            "fake-refresh-token",
+            result.RefreshSession.RawToken);
 
+        Assert.Equal(
+            refreshExpiration,
+            result.RefreshSession.ExpiresAtUtc);
+
+        // Verify JWT generation
         jwtTokenGenerator.Verify(
             x => x.Generate(
-                "user-123",
-                "student@test.com",
+                user.Id,
+                email,
                 It.Is<IReadOnlyCollection<string>>(
                     roles =>
-                        roles.Contains(
-                            Roles.Student))),
+                        roles.Count == 1 &&
+                        roles.Contains(Roles.Student))),
+            Times.Once);
+
+        // Verify refresh session creation
+        refreshSessionIssuer.Verify(
+            x => x.CreateAsync(
+                user.Id,
+                It.IsAny<CancellationToken>()),
             Times.Once);
     }
+
     // ============================= private helper methods ===============================
     private static Mock<UserManager<AppUser>> CreateMockUserManager()
     {
@@ -965,26 +986,36 @@ public class AuthServiceTests
       Mock<UserManager<AppUser>> userManager,
       AlDarDbContext dbContext,
       Mock<IEmailService>? emailService = null,
-      Mock<IJwtTokenGenerator>? jwtTokenGenerator = null)
+      Mock<IJwtTokenGenerator>? jwtTokenGenerator = null,
+      Mock<IRefreshSessionIssuer>? refreshSessionIssuer = null)
     {
-        emailService ??=
-            new Mock<IEmailService>();
+        emailService ??= new Mock<IEmailService>();
 
-        jwtTokenGenerator ??=
-            new Mock<IJwtTokenGenerator>();
+        jwtTokenGenerator ??= new Mock<IJwtTokenGenerator>();
 
-        var configuration =
-            new ConfigurationBuilder()
-                .AddInMemoryCollection(
-                    new Dictionary<string, string?>
-                    {
-                        ["Client:BaseUrl"] =
-                            "http://localhost:4200"
-                    })
-                .Build();
+        if (refreshSessionIssuer is null)
+        {
+            refreshSessionIssuer = new Mock<IRefreshSessionIssuer>();
 
-        var logger =
-            Mock.Of<ILogger<AuthService>>();
+            refreshSessionIssuer
+                .Setup(x => x.CreateAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(
+                    new CreatedRefreshSession(
+                        "fake-refresh-token",
+                        DateTime.UtcNow.AddDays(7)));
+        }
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    ["Client:BaseUrl"] = "http://localhost:4200"
+                })
+            .Build();
+
+        var logger = Mock.Of<ILogger<AuthService>>();
 
         return new AuthService(
             userManager.Object,
@@ -992,7 +1023,8 @@ public class AuthServiceTests
             emailService.Object,
             configuration,
             logger,
-            jwtTokenGenerator.Object);
+            jwtTokenGenerator.Object,
+            refreshSessionIssuer.Object);
     }
 
 }

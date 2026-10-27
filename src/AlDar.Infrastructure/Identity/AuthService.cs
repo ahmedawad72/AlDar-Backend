@@ -19,14 +19,16 @@ public sealed class AuthService : IAuthService
     private readonly IConfiguration _configuration;
     private readonly ILogger<AuthService> _logger;
     private readonly IJwtTokenGenerator _jwtTokenGenerator;
+    private readonly IRefreshSessionIssuer _refreshSessionIssuer;
 
     public AuthService(
-     UserManager<AppUser> userManager,
-     AlDarDbContext dbContext,
-     IEmailService emailService,
-     IConfiguration configuration,
-     ILogger<AuthService> logger,
-     IJwtTokenGenerator jwtTokenGenerator)
+        UserManager<AppUser> userManager,
+        AlDarDbContext dbContext,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ILogger<AuthService> logger,
+        IJwtTokenGenerator jwtTokenGenerator,
+        IRefreshSessionIssuer refreshSessionIssuer)
     {
         _userManager = userManager;
         _dbContext = dbContext;
@@ -34,6 +36,7 @@ public sealed class AuthService : IAuthService
         _configuration = configuration;
         _logger = logger;
         _jwtTokenGenerator = jwtTokenGenerator;
+        _refreshSessionIssuer = refreshSessionIssuer;
     }
 
     public async Task<RegisterResponse> RegisterAsync(RegisterRequest request)
@@ -108,7 +111,7 @@ public sealed class AuthService : IAuthService
         return await TrySendConfirmationEmailAsync(user);
     }
 
-    public async Task<LoginResponse> LoginAsync(LoginRequest request)
+    public async Task<AuthenticationResult> LoginAsync(LoginRequest request)
     {
         ValidateLoginRequest(request);
 
@@ -152,7 +155,7 @@ public sealed class AuthService : IAuthService
         var token =
             _jwtTokenGenerator.Generate(user.Id,user.Email!,roleClaims);
 
-        return new LoginResponse
+        var loginResponse = new LoginResponse
         {
             AccessToken = token.AccessToken,
             ExpiresAtUtc = token.ExpiresAtUtc,
@@ -161,6 +164,10 @@ public sealed class AuthService : IAuthService
             DisplayName = user.DisplayName,
             Roles = roleClaims
         };
+
+        var refreshSession = await _refreshSessionIssuer.CreateAsync(user.Id);
+
+        return new AuthenticationResult(loginResponse, refreshSession);
     }
 
     // ============================= Private Methods =============================

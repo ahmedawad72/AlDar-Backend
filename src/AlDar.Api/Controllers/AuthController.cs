@@ -1,8 +1,9 @@
 ﻿using AlDar.Application.Authentication;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
-using System.Security.Claims;
 using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 namespace AlDar.Api.Controllers;
 
 [ApiController]
@@ -59,10 +60,22 @@ public class AuthController : ControllerBase
     [HttpPost("login")]
     public async Task<ActionResult<LoginResponse>> Login(LoginRequest request)
     {
-        var response =
-            await _authService.LoginAsync(request);
+        var result = await _authService.LoginAsync(request);
+        Response.Cookies.Append(
+        "aldar.refresh",
+        result.RefreshSession.RawToken,
+        new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Path = "/api/auth",
+            Expires = new DateTimeOffset(
+                result.RefreshSession.ExpiresAtUtc,
+                TimeSpan.Zero)
+        });
 
-        return Ok(response);
+        return Ok(result.Response);
     }
 
     [Authorize]
