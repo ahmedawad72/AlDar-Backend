@@ -204,7 +204,7 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
     }
 
     [Fact]
-    public async Task Refresh_WhenOldTokenIsReused_ShouldRejectReplay()
+    public async Task Refresh_WhenOldTokenIsReusedAfterWindow_ShouldRevokeFamily()
     {
         // Arrange
         var user = await CreateConfirmedStudentAsync();
@@ -216,7 +216,6 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
 
         var originalToken = GetRefreshToken(loginResponse);
 
-        // First refresh succeeds.
         using var firstRefresh =
             await PostRefreshAsync(originalToken);
 
@@ -224,16 +223,33 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
 
         var replacementToken = GetRefreshToken(firstRefresh);
 
-        // Act: attempt to reuse the consumed token.
+        // Simulate the first token having been consumed
+        // more than five seconds ago.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext =
+                scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+            var oldSession = await dbContext.RefreshTokens.SingleAsync(
+                x => x.TokenHash ==
+                    RefreshTokenSecurity.HashToken(originalToken));
+
+            oldSession.ConsumedAtUtc =
+                DateTime.UtcNow.AddMinutes(-1);
+
+            await dbContext.SaveChangesAsync();
+        }
+
+        // Act: reuse the old token outside the window.
         using var replayResponse =
             await PostRefreshAsync(originalToken);
 
-        // Assert: replay is rejected.
+        // Assert
         Assert.Equal(
             HttpStatusCode.Unauthorized,
             replayResponse.StatusCode);
 
-        // Our current replay policy revokes the session family.
+        // The replacement must also be rejected.
         using var nextResponse =
             await PostRefreshAsync(replacementToken);
 
@@ -241,12 +257,13 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
             HttpStatusCode.Unauthorized,
             nextResponse.StatusCode);
 
-        using var scope = _factory.Services.CreateScope();
+        using var verificationScope = _factory.Services.CreateScope();
 
-        var dbContext =
-            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+        var verificationDb =
+            verificationScope.ServiceProvider
+                .GetRequiredService<AlDarDbContext>();
 
-        var sessions = await dbContext.RefreshTokens
+        var sessions = await verificationDb.RefreshTokens
             .AsNoTracking()
             .Where(x => x.UserId == user.UserId)
             .ToListAsync();
@@ -438,6 +455,136 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
         Assert.Null(phoneSession.RevokedAtUtc);
     }
 
+    [Fact]    //Two browser tabs send the same refresh token almost simultaneously.
+    public async Task Refresh_WhenTokenIsImmediatelyRetried_ShouldPreserveNewSession()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            loginResponse.StatusCode);
+
+        var originalToken = GetRefreshToken(loginResponse);
+
+        // First refresh succeeds.
+        using var firstRefresh =
+            await PostRefreshAsync(originalToken);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            firstRefresh.StatusCode);
+
+        var replacementToken = GetRefreshToken(firstRefresh);
+
+        // Act: A second request carries the previous token.
+        using var duplicateRefresh =
+            await PostRefreshAsync(originalToken);
+
+        // Duplicate request must not receive credentials.
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            duplicateRefresh.StatusCode);
+
+        // But the successfully rotated session
+        // should remain valid.
+        using var validRefresh =
+            await PostRefreshAsync(replacementToken);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            validRefresh.StatusCode);
+    }
+
+    [Fact]
+    public async Task Refresh_WhenTwoRequestsArriveTogether_ShouldPreserveSession()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            loginResponse.StatusCode);
+
+        var originalToken = GetRefreshToken(loginResponse);
+
+        // Act: Two requests using the same refresh token.
+        var firstTask = PostRefreshAsync(originalToken);
+        var secondTask = PostRefreshAsync(originalToken);
+
+        var responses = await Task.WhenAll(
+            firstTask,
+            secondTask);
+
+        using var firstResponse = responses[0];
+        using var secondResponse = responses[1];
+
+        // Diagnose the actual responses.
+        var firstStatus = firstResponse.StatusCode;
+        var secondStatus = secondResponse.StatusCode;
+
+        var successCount = responses.Count(
+            x => x.StatusCode == HttpStatusCode.OK);
+
+        var unauthorizedCount = responses.Count(
+            x => x.StatusCode == HttpStatusCode.Unauthorized);
+
+        var statusReport =
+            $"First: {(int)firstStatus} {firstStatus}, " +
+            $"Second: {(int)secondStatus} {secondStatus}. " +
+            $"Success count: {successCount}, " +
+            $"Unauthorized count: {unauthorizedCount}.";
+
+        // Assert: Exactly one request must succeed.
+        Assert.True(
+            successCount == 1 && unauthorizedCount == 1,
+            $"Unexpected concurrent refresh results. {statusReport}");
+
+        var successfulResponse = responses.Single(
+            x => x.StatusCode == HttpStatusCode.OK);
+
+        var replacementToken =
+            GetRefreshToken(successfulResponse);
+
+        Assert.NotEqual(originalToken, replacementToken);
+
+        // Assert: Database contains exactly two tokens.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext =
+                scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+            var sessions = await dbContext.RefreshTokens
+                .AsNoTracking()
+                .Where(x => x.UserId == user.UserId)
+                .ToListAsync();
+
+            Assert.Equal(2, sessions.Count);
+
+            Assert.Single(
+                sessions,
+                x => x.ConsumedAtUtc is not null);
+
+            Assert.Single(
+                sessions,
+                x => x.ConsumedAtUtc is null &&
+                     x.RevokedAtUtc is null);
+        }
+
+        // Assert: Replacement token remains usable.
+        using var nextRefresh =
+            await PostRefreshAsync(replacementToken);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            nextRefresh.StatusCode);
+    }
     // ------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------

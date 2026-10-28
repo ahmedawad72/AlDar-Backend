@@ -12,6 +12,9 @@ public sealed class RefreshSessionRotator(
     TimeProvider timeProvider)
     : IRefreshSessionRotator
 {
+    private static readonly TimeSpan DuplicateWindow =
+        TimeSpan.FromSeconds(5);
+
     public async Task<string?> InspectAsync(string rawToken,CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(rawToken))
@@ -26,23 +29,19 @@ public sealed class RefreshSessionRotator(
                 x => x.TokenHash == tokenHash,
                 cancellationToken);
 
-        if (session is null)
+        if (session is null || session.RevokedAtUtc is not null)
             return null;
 
-        // Detect reuse of a previously consumed token.
         if (session.ConsumedAtUtc is not null)
         {
-            await RevokeFamilyAsync(
-                session.FamilyId,
-                now,
+            await HandleConsumedTokenAsync(
+                session,
                 cancellationToken);
 
             return null;
         }
 
-        // Reject revoked or expired tokens.
-        if (session.RevokedAtUtc is not null ||
-            session.ExpiresAtUtc <= now ||
+        if (session.ExpiresAtUtc <= now ||
             session.AbsoluteExpiresAtUtc <= now)
         {
             return null;
@@ -65,20 +64,20 @@ public sealed class RefreshSessionRotator(
                 x => x.TokenHash == tokenHash,
                 cancellationToken);
 
-        if (currentToken is null)
+        if (currentToken is null ||
+            currentToken.RevokedAtUtc is not null)
+        {
             return null;
+        }
 
-        // Reusing a consumed token indicates possible replay.
         if (currentToken.ConsumedAtUtc is not null)
         {
-            await RevokeFamilyAsync(currentToken.FamilyId, now,cancellationToken);
+            await HandleConsumedTokenAsync(currentToken,cancellationToken);
 
             return null;
         }
 
-        // Reject revoked or expired tokens.
-        if (currentToken.RevokedAtUtc is not null ||
-            currentToken.ExpiresAtUtc <= now ||
+        if (currentToken.ExpiresAtUtc <= now ||
             currentToken.AbsoluteExpiresAtUtc <= now)
         {
             return null;
@@ -87,7 +86,6 @@ public sealed class RefreshSessionRotator(
         await using var transaction =
             await dbContext.Database.BeginTransactionAsync(cancellationToken);
 
-        // Atomically consume the old token.
         var affectedRows = await dbContext.RefreshTokens
             .Where(x =>
                 x.Id == currentToken.Id &&
@@ -105,31 +103,28 @@ public sealed class RefreshSessionRotator(
         {
             await transaction.RollbackAsync(cancellationToken);
 
-            // Distinguish replay from other validation failures.
-            var wasConsumed = await dbContext.RefreshTokens
+            var latestState = await dbContext.RefreshTokens
                 .AsNoTracking()
-                .Where(x => x.Id == currentToken.Id)
-                .Select(x => x.ConsumedAtUtc != null)
-                .SingleOrDefaultAsync(cancellationToken);
+                .SingleOrDefaultAsync(
+                    x => x.Id == currentToken.Id,
+                    cancellationToken);
 
-            if (wasConsumed)
+            if (latestState is not null &&
+                latestState.RevokedAtUtc is null &&
+                latestState.ConsumedAtUtc is not null)
             {
-                await RevokeFamilyAsync(
-                    currentToken.FamilyId,
-                    now,
+                await HandleConsumedTokenAsync(
+                    latestState,
                     cancellationToken);
             }
 
             return null;
         }
 
-        // Generate the replacement refresh token.
         var newRawToken = RefreshTokenSecurity.GenerateToken();
 
-        var newExpiration =
-            now.AddDays(options.Value.TokenLifetimeDays);
+        var newExpiration = now.AddDays(options.Value.TokenLifetimeDays);
 
-        // Never extend beyond the absolute session lifetime.
         if (newExpiration > currentToken.AbsoluteExpiresAtUtc)
         {
             newExpiration = currentToken.AbsoluteExpiresAtUtc;
@@ -148,12 +143,50 @@ public sealed class RefreshSessionRotator(
         dbContext.RefreshTokens.Add(replacement);
 
         await dbContext.SaveChangesAsync(cancellationToken);
-
         await transaction.CommitAsync(cancellationToken);
 
         return new RotatedRefreshSession(
-            currentToken.UserId,
-            new CreatedRefreshSession(newRawToken,newExpiration));
+            currentToken.UserId, new CreatedRefreshSession( newRawToken,newExpiration));
+    }
+
+    private async Task HandleConsumedTokenAsync(RefreshToken consumedToken,CancellationToken cancellationToken)
+    {
+        // IMPORTANT:
+        // Get a fresh timestamp AFTER detecting consumption.
+        // Do not reuse a time captured before database queries.
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+
+        var consumedAt = consumedToken.ConsumedAtUtc!.Value;
+        var elapsed = now - consumedAt;
+
+        if (elapsed >= TimeSpan.Zero &&
+            elapsed <= DuplicateWindow)
+        {
+            var successors = await dbContext.RefreshTokens
+                .AsNoTracking()
+                .Where(x =>
+                    x.FamilyId == consumedToken.FamilyId &&
+                    x.Id != consumedToken.Id &&
+                    x.CreatedAtUtc >= consumedAt)
+                .Select(x => new
+                {
+                    x.ConsumedAtUtc,
+                    x.RevokedAtUtc
+                })
+                .Take(2)
+                .ToListAsync(cancellationToken);
+
+            if (successors.Count == 1 &&
+                successors[0].ConsumedAtUtc is null &&
+                successors[0].RevokedAtUtc is null)
+            {
+                // Reject duplicate without revoking
+                // the successfully rotated session.
+                return;
+            }
+        }
+
+        await RevokeFamilyAsync(consumedToken.FamilyId,now,cancellationToken);
     }
 
     public async Task RevokeAsync(string? rawToken,CancellationToken cancellationToken = default)
@@ -161,10 +194,8 @@ public sealed class RefreshSessionRotator(
         if (string.IsNullOrWhiteSpace(rawToken))
             return;
 
-        // 1. Hash the token supplied through the cookie.
         var tokenHash = RefreshTokenSecurity.HashToken(rawToken);
 
-        // 2. Find the session family.
         var familyId = await dbContext.RefreshTokens
             .AsNoTracking()
             .Where(x => x.TokenHash == tokenHash)
@@ -174,13 +205,12 @@ public sealed class RefreshSessionRotator(
         if (familyId is null)
             return;
 
-        // 3. Revoke the entire browser session family.
         var now = timeProvider.GetUtcNow().UtcDateTime;
 
-        await RevokeFamilyAsync( familyId.Value,now,cancellationToken);
+        await RevokeFamilyAsync(familyId.Value,now,cancellationToken);
     }
 
-    private async Task RevokeFamilyAsync(Guid familyId,DateTime now,CancellationToken cancellationToken)
+    private async Task RevokeFamilyAsync(Guid familyId,DateTime now, CancellationToken cancellationToken)
     {
         await dbContext.RefreshTokens
             .Where(x =>

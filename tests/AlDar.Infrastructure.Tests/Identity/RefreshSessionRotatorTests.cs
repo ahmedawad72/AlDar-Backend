@@ -115,7 +115,7 @@ public sealed class RefreshSessionRotatorTests
     }
 
     [Fact]
-    public async Task RotateAsync_WhenConsumedTokenIsReused_ShouldRevokeFamily()
+    public async Task RotateAsync_WhenConsumedTokenIsReusedAfterWindow_ShouldRevokeFamily()
     {
         // Arrange
         await using var connection =
@@ -152,7 +152,7 @@ public sealed class RefreshSessionRotatorTests
 
         timeProvider
             .Setup(x => x.GetUtcNow())
-            .Returns(now);
+            .Returns(() => now);
 
         var options = Options.Create(
             new RefreshSessionOptions
@@ -162,30 +162,29 @@ public sealed class RefreshSessionRotatorTests
             });
 
         var issuer = new RefreshSessionIssuer(
-            dbContext,
-            options,
-            timeProvider.Object);
+            dbContext, options, timeProvider.Object);
 
         var originalSession =
             await issuer.CreateAsync(user.Id);
 
         var rotator = new RefreshSessionRotator(
-            dbContext,
-            options,
-            timeProvider.Object);
+            dbContext, options, timeProvider.Object);
 
-        // First rotation succeeds
-        var firstRotation = await rotator.RotateAsync(
-            originalSession.RawToken);
+        // First rotation succeeds.
+        var firstRotation =
+            await rotator.RotateAsync(originalSession.RawToken);
 
         Assert.NotNull(firstRotation);
 
-        // Act: Reuse the old token
-        var secondRotation = await rotator.RotateAsync(
-            originalSession.RawToken);
+        // Advance time beyond the duplicate window.
+        now = now.AddSeconds(6);
+
+        // Act: reuse consumed token.
+        var replayResult =
+            await rotator.RotateAsync(originalSession.RawToken);
 
         // Assert
-        Assert.Null(secondRotation);
+        Assert.Null(replayResult);
 
         var sessions = await dbContext.RefreshTokens
             .AsNoTracking()
@@ -197,10 +196,10 @@ public sealed class RefreshSessionRotatorTests
             sessions,
             session => Assert.NotNull(session.RevokedAtUtc));
 
-        // Even the replacement is now rejected
-        var rejectedReplacement = await rotator.RotateAsync(
-            firstRotation.RefreshSession.RawToken);
+        var replacementResult =
+            await rotator.RotateAsync(
+                firstRotation.RefreshSession.RawToken);
 
-        Assert.Null(rejectedReplacement);
+        Assert.Null(replacementResult);
     }
 }
