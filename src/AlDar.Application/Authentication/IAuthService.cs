@@ -5,5 +5,7 @@ public interface IAuthService
     Task<RegisterResponse> RegisterAsync(RegisterRequest request);
     Task ConfirmEmailAsync( ConfirmEmailRequest request);
     Task<bool> ResendConfirmationEmailAsync(ResendConfirmationEmailRequest request);
-    Task<LoginResponse> LoginAsync(LoginRequest request);
+    Task<AuthenticationResult> LoginAsync( LoginRequest request);
+    Task<AuthenticationResult?> RefreshAsync(string rawToken,CancellationToken cancellationToken = default);
+    Task LogoutAsync(string? rawToken,CancellationToken cancellationToken = default);
 }

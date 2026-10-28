@@ -14,13 +14,23 @@ using System.Data.Common;
 
 namespace AlDar.Api.IntegrationTests;
 
-public class CustomWebApplicationFactory : WebApplicationFactory<Program>
+public class CustomWebApplicationFactory
+    : WebApplicationFactory<Program>
 {
+    // A unique database for each factory instance.
+    private readonly string _connectionString =
+        new SqliteConnectionStringBuilder
+        {
+            DataSource = $"AlDarTests_{Guid.NewGuid():N}",
+            Mode = SqliteOpenMode.Memory,
+            Cache = SqliteCacheMode.Shared
+        }.ToString();
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
 
-        builder.UseSetting( 
+        builder.UseSetting(
             "Client:BaseUrl",
             "http://localhost:4200");
 
@@ -42,36 +52,29 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
 
         builder.ConfigureServices(services =>
         {
-            var dbContextConfigurationDescriptor = services.SingleOrDefault(
-                d => d.ServiceType ==
-                    typeof( IDbContextOptionsConfiguration<AlDarDbContext>)
-            );
+            // Remove the production database configuration.
+            services.RemoveAll<
+                IDbContextOptionsConfiguration<AlDarDbContext>>();
 
-            if (dbContextConfigurationDescriptor is not null)
-            {
-                services.Remove(dbContextConfigurationDescriptor);
-            }
-
+            // Keep one connection open so the named
+            // in-memory database stays alive.
             services.AddSingleton<DbConnection>(_ =>
             {
                 var connection =
-                    new SqliteConnection("DataSource=:memory:");
+                    new SqliteConnection(_connectionString);
 
                 connection.Open();
 
                 return connection;
             });
 
+            // IMPORTANT:
+            // Each DbContext now uses its own connection,
+            // but all connections share the same test database.
             services.AddDbContext<AlDarDbContext>(
-                (serviceProvider, options) =>
-                {
-                    var connection =
-                        serviceProvider
-                            .GetRequiredService<DbConnection>();
+                options => options.UseSqlite(_connectionString));
 
-                    options.UseSqlite(connection);
-                });
-
+            // Replace email delivery with our test fake.
             services.RemoveAll<IEmailService>();
 
             services.AddSingleton<TestEmailService>();
@@ -87,12 +90,15 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
     {
         var host = base.CreateHost(builder);
 
-        using var scope =
-            host.Services.CreateScope();
+        using var scope = host.Services.CreateScope();
 
-        var dbContext =
-            scope.ServiceProvider
-                .GetRequiredService<AlDarDbContext>();
+        // Open the keeper connection before database setup.
+        // This keeps the named in-memory database alive.
+        _ = scope.ServiceProvider
+            .GetRequiredService<DbConnection>();
+
+        var dbContext = scope.ServiceProvider
+            .GetRequiredService<AlDarDbContext>();
 
         dbContext.Database.EnsureCreated();
 

@@ -1,7 +1,9 @@
-﻿using AlDar.Api.IntegrationTests.Fakes;
+using AlDar.Api.IntegrationTests.Fakes;
 using AlDar.Application.Authentication;
 using AlDar.Application.Exceptions;
 using AlDar.Domain.Constants;
+using AlDar.Infrastructure.Authentication;
+using AlDar.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
@@ -10,6 +12,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
 
 namespace AlDar.Api.IntegrationTests.Authentication;
 
@@ -21,7 +24,13 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
     public LoginTests(CustomWebApplicationFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateClient(
+            new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions
+            {
+                BaseAddress = new Uri("https://localhost"),
+                HandleCookies = false,
+                AllowAutoRedirect = false
+            });
     }
 
     [Fact]
@@ -37,7 +46,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 request);
 
@@ -92,7 +102,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 loginRequest);
 
@@ -205,7 +216,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 loginRequest);
 
@@ -324,7 +336,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
         for (var attempt = 1; attempt <= 5; attempt++)
         {
             var failedResponse =
-                await _client.PostAsJsonAsync(
+                await CsrfTestRequest.PostAsync(
+                    _client,
                     "/api/auth/login",
                     wrongLoginRequest);
 
@@ -342,7 +355,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             };
 
         var lockedResponse =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 correctLoginRequest);
 
@@ -475,7 +489,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             confirmResponse.StatusCode);
 
         var loginResponse =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 new LoginRequest
                 {
@@ -543,7 +558,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 request);
 
@@ -566,6 +582,193 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             problemDetails.Extensions.ContainsKey(
                 "errors"));
     }
+
+    [Fact]
+    public async Task Login_WhenSuccessful_ShouldSetSecureRefreshCookie()
+    {
+        // Arrange
+        var emailService =
+            _factory.Services.GetRequiredService<TestEmailService>();
+
+        emailService.Clear();
+
+        var email = "refresh-cookie@test.com";
+        var password = "Password123!";
+
+        var registerRequest = new RegisterRequest
+        {
+            Email = email,
+            Password = password,
+            DisplayName = "Refresh Cookie User",
+            Role = Roles.Student
+        };
+
+        var registerResponse =
+            await _client.PostAsJsonAsync(
+                "/api/auth/register",
+                registerRequest);
+
+        Assert.Equal(
+            HttpStatusCode.Created,
+            registerResponse.StatusCode);
+
+        // Confirm the email
+        var confirmationEmail =
+            Assert.Single(emailService.SentEmails);
+
+        var confirmationLink =
+            ExtractConfirmationLink(
+                confirmationEmail.HtmlBody);
+
+        var confirmationUri = new Uri(confirmationLink);
+
+        var query =
+            QueryHelpers.ParseQuery(
+                confirmationUri.Query);
+
+        var confirmRequest = new ConfirmEmailRequest
+        {
+            UserId = query["userId"].ToString(),
+            Token = query["token"].ToString()
+        };
+
+        var confirmResponse =
+            await _client.PostAsJsonAsync(
+                "/api/auth/confirm-email",
+                confirmRequest);
+
+        Assert.Equal(
+            HttpStatusCode.NoContent,
+            confirmResponse.StatusCode);
+
+        // Act: Login
+        var loginResponse =
+            await CsrfTestRequest.PostAsync(
+                _client,
+                "/api/auth/login",
+                new LoginRequest
+                {
+                    Email = email,
+                    Password = password
+                });
+
+        // Assert: Login succeeded
+        Assert.Equal(
+            HttpStatusCode.OK,
+            loginResponse.StatusCode);
+
+        var login =
+            await loginResponse.Content
+                .ReadFromJsonAsync<LoginResponse>();
+
+        Assert.NotNull(login);
+        Assert.False(string.IsNullOrWhiteSpace(login.AccessToken));
+
+        // Assert: Refresh cookie exists
+        Assert.True(
+            loginResponse.Headers.TryGetValues(
+                "Set-Cookie",
+                out var cookies));
+
+        var refreshCookie = Assert.Single(
+            cookies!,
+            cookie => cookie.StartsWith(
+                "aldar.refresh=",
+                StringComparison.OrdinalIgnoreCase));
+
+        Assert.Contains(
+            "httponly",
+            refreshCookie,
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Contains(
+            "secure",
+            refreshCookie,
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Contains(
+            "samesite=strict",
+            refreshCookie,
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Contains(
+            "path=/api/auth",
+            refreshCookie,
+            StringComparison.OrdinalIgnoreCase);
+
+        // Extract raw token from Set-Cookie for testing only
+        var rawToken = refreshCookie
+            .Split(';')[0]
+            .Split('=', 2)[1];
+
+        Assert.False(string.IsNullOrWhiteSpace(rawToken));
+
+        // Assert: Database stores only token hash
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider
+                .GetRequiredService<AlDarDbContext>();
+
+        var savedSession =
+            await dbContext.RefreshTokens
+                .AsNoTracking()
+                .SingleAsync(x => x.UserId == login.UserId);
+
+        Assert.Equal(
+            RefreshTokenSecurity.HashToken(rawToken),
+            savedSession.TokenHash);
+
+        Assert.NotEqual(
+            rawToken,
+            savedSession.TokenHash);
+
+        // Assert: Refresh token is NOT in JSON
+        var responseJson =
+            await loginResponse.Content.ReadAsStringAsync();
+
+        using var document =
+            JsonDocument.Parse(responseJson);
+
+        Assert.False(
+            document.RootElement.TryGetProperty(
+                "refreshToken",
+                out _));
+
+        Assert.False(
+            document.RootElement.TryGetProperty(
+                "refreshSession",
+                out _));
+
+        Assert.False(
+            document.RootElement.TryGetProperty(
+                "rawToken",
+                out _));
+
+        Assert.DoesNotContain(
+            rawToken,
+            responseJson);
+    }
+
+
+    [Fact]
+    public async Task Login_WithoutCsrfToken_ShouldReturnBadRequest()
+    {
+        // Arrange: a syntactically valid login request without CSRF credentials.
+        var request = new LoginRequest
+        {
+            Email = "missing-csrf@test.com",
+            Password = "Password123!"
+        };
+
+        // Act: deliberately bypass CsrfTestRequest.
+        using var response = await _client.PostAsJsonAsync(
+            "/api/auth/login", request);
+
+        // Assert: CSRF validation rejects the request before login executes.
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
     // _____________________________Private Helper Methods_____________________________
     private static string ExtractConfirmationLink( string htmlBody)
     {

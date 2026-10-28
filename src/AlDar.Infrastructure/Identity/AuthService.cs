@@ -19,14 +19,18 @@ public sealed class AuthService : IAuthService
     private readonly IConfiguration _configuration;
     private readonly ILogger<AuthService> _logger;
     private readonly IJwtTokenGenerator _jwtTokenGenerator;
+    private readonly IRefreshSessionIssuer _refreshSessionIssuer;
+    private readonly IRefreshSessionRotator _refreshSessionRotator;
 
     public AuthService(
-     UserManager<AppUser> userManager,
-     AlDarDbContext dbContext,
-     IEmailService emailService,
-     IConfiguration configuration,
-     ILogger<AuthService> logger,
-     IJwtTokenGenerator jwtTokenGenerator)
+        UserManager<AppUser> userManager,
+        AlDarDbContext dbContext,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ILogger<AuthService> logger,
+        IJwtTokenGenerator jwtTokenGenerator,
+        IRefreshSessionIssuer refreshSessionIssuer,
+        IRefreshSessionRotator refreshSessionRotator)
     {
         _userManager = userManager;
         _dbContext = dbContext;
@@ -34,6 +38,8 @@ public sealed class AuthService : IAuthService
         _configuration = configuration;
         _logger = logger;
         _jwtTokenGenerator = jwtTokenGenerator;
+        _refreshSessionIssuer = refreshSessionIssuer;
+        _refreshSessionRotator = refreshSessionRotator;
     }
 
     public async Task<RegisterResponse> RegisterAsync(RegisterRequest request)
@@ -108,7 +114,7 @@ public sealed class AuthService : IAuthService
         return await TrySendConfirmationEmailAsync(user);
     }
 
-    public async Task<LoginResponse> LoginAsync(LoginRequest request)
+    public async Task<AuthenticationResult> LoginAsync(LoginRequest request)
     {
         ValidateLoginRequest(request);
 
@@ -152,7 +158,7 @@ public sealed class AuthService : IAuthService
         var token =
             _jwtTokenGenerator.Generate(user.Id,user.Email!,roleClaims);
 
-        return new LoginResponse
+        var loginResponse = new LoginResponse
         {
             AccessToken = token.AccessToken,
             ExpiresAtUtc = token.ExpiresAtUtc,
@@ -161,7 +167,71 @@ public sealed class AuthService : IAuthService
             DisplayName = user.DisplayName,
             Roles = roleClaims
         };
+
+        var refreshSession = await _refreshSessionIssuer.CreateAsync(user.Id);
+
+        return new AuthenticationResult(loginResponse, refreshSession);
     }
+
+    public async Task<AuthenticationResult?> RefreshAsync(string rawToken, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(rawToken))
+            return null;
+
+        // 1. Validate the refresh token and retrieve its UserId.
+        // The token is not consumed here.
+        var userId = await _refreshSessionRotator.InspectAsync(
+            rawToken, cancellationToken);
+
+        if (userId is null)
+            return null;
+
+        // 2. Retrieve the current user.
+        var user = await _userManager.FindByIdAsync(userId);
+
+        if (user is null || string.IsNullOrWhiteSpace(user.Email))
+            return null;
+
+        // 3. Verify the account is allowed to authenticate.
+        if (!await _userManager.IsEmailConfirmedAsync(user))
+            return null;
+
+        if (await _userManager.IsLockedOutAsync(user))
+            return null;
+
+        // 4. Retrieve current roles from Identity.
+        var roles = await _userManager.GetRolesAsync(user);
+        var roleClaims = roles.ToArray();
+
+        // 5. Generate a fresh JWT in memory.
+        var token = _jwtTokenGenerator.Generate(user.Id, user.Email, roleClaims);
+
+        // 6. Rotate the refresh token LAST.
+        // Atomically consume the old token and save its replacement.
+        var rotatedSession = await _refreshSessionRotator.RotateAsync(rawToken, cancellationToken);
+
+        if (rotatedSession is null)
+            return null;
+
+        // 7. Build the public response.
+        var response = new LoginResponse
+        {
+            AccessToken = token.AccessToken,
+            ExpiresAtUtc = token.ExpiresAtUtc,
+            UserId = user.Id,
+            Email = user.Email,
+            DisplayName = user.DisplayName,
+            Roles = roleClaims
+        };
+
+        return new AuthenticationResult(response, rotatedSession.RefreshSession);
+    }
+
+    public Task LogoutAsync(string? rawToken, CancellationToken cancellationToken = default)
+    {
+        return _refreshSessionRotator.RevokeAsync( rawToken,cancellationToken);
+    }
+
 
     // ============================= Private Methods =============================
 

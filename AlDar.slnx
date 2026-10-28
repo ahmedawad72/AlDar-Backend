@@ -7,6 +7,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AlDar.Api.IntegrationTests/AlDar.Api.IntegrationTests.csproj" />
-    <Project Path="tests/AlDar.Infrastructure.Tests/AlDar.Infrastructure.UnitTests.csproj" />
+    <Project Path="tests/AlDar.Infrastructure.UnitTests/AlDar.Infrastructure.UnitTests.csproj" />
   </Folder>
 </Solution>

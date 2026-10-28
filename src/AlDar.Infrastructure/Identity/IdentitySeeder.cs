@@ -6,8 +6,7 @@ namespace AlDar.Infrastructure.Identity;
 
 public static class IdentitySeeder
 {
-    public static async Task SeedRolesAsync(
-        IServiceProvider serviceProvider)
+    public static async Task SeedRolesAsync(IServiceProvider serviceProvider)
     {
         var roles = new[]
         {
