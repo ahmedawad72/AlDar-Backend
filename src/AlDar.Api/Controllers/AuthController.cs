@@ -79,8 +79,7 @@ public class AuthController : ControllerBase
 
     [HttpPost("refresh")]
     [AllowAnonymous]
-    public async Task<ActionResult<LoginResponse>> Refresh(
-    CancellationToken cancellationToken)
+    public async Task<ActionResult<LoginResponse>> Refresh( CancellationToken cancellationToken)
     {
         // 1. Read the refresh token from the HttpOnly cookie.
         if (!Request.Cookies.TryGetValue(
@@ -115,6 +114,32 @@ public class AuthController : ControllerBase
         // 4. Return only the JWT and current user information.
         return Ok(result.Response);
     }
+
+    [HttpPost("logout")]
+    [AllowAnonymous]
+    public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+    {
+        // 1. Retrieve the refresh credential, if present.
+        Request.Cookies.TryGetValue( "aldar.refresh", out var rawToken);
+
+        // 2. Revoke the session family.
+        await _authService.LogoutAsync( rawToken,cancellationToken);
+
+        // 3. Delete the refresh cookie.
+        Response.Cookies.Delete(
+            "aldar.refresh",
+            new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = true,
+                SameSite = SameSiteMode.Strict,
+                Path = "/api/auth"
+            });
+
+        // 4. Always return success after processing.
+        return NoContent();
+    }
+
     [Authorize]
     [HttpGet("me")]
     public ActionResult<CurrentUserResponse> Me()

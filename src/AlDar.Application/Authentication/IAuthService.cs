@@ -7,4 +7,5 @@ public interface IAuthService
     Task<bool> ResendConfirmationEmailAsync(ResendConfirmationEmailRequest request);
     Task<AuthenticationResult> LoginAsync( LoginRequest request);
     Task<AuthenticationResult?> RefreshAsync(string rawToken,CancellationToken cancellationToken = default);
+    Task LogoutAsync(string? rawToken,CancellationToken cancellationToken = default);
 }

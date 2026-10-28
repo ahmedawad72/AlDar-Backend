@@ -13,8 +13,7 @@ using Xunit;
 
 namespace AlDar.Api.IntegrationTests.Authentication;
 
-public sealed class RefreshTests
-    : IClassFixture<CustomWebApplicationFactory>, IDisposable
+public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, IDisposable
 {
     private readonly CustomWebApplicationFactory _factory;
     private readonly HttpClient _client;
@@ -259,12 +258,191 @@ public sealed class RefreshTests
             session => Assert.NotNull(session.RevokedAtUtc));
     }
 
+    [Fact]
+    public async Task Logout_WithValidCookie_ShouldRevokeSessionAndDeleteCookie()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+
+        var rawToken = GetRefreshToken(loginResponse);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "/api/auth/logout");
+
+        request.Headers.TryAddWithoutValidation(
+            "Cookie",
+            $"aldar.refresh={rawToken}");
+
+        // Act
+        using var response = await _client.SendAsync(request);
+
+        // Assert: Logout succeeds
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        // Assert: Cookie is deleted
+        var cookieHeader = GetRefreshCookieHeader(response);
+
+        Assert.Contains(
+            "path=/api/auth",
+            cookieHeader,
+            StringComparison.OrdinalIgnoreCase);
+
+        var cookieValue = cookieHeader.Split(';', 2)[0];
+
+        Assert.Equal("aldar.refresh=", cookieValue);
+
+        Assert.True(
+            cookieHeader.Contains(
+                "expires=",
+                StringComparison.OrdinalIgnoreCase) ||
+            cookieHeader.Contains(
+                "max-age=0",
+                StringComparison.OrdinalIgnoreCase));
+
+        // Assert: Database session was revoked
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+        var session = await dbContext.RefreshTokens
+            .AsNoTracking()
+            .SingleAsync(x =>
+                x.TokenHash ==
+                RefreshTokenSecurity.HashToken(rawToken));
+
+        Assert.NotNull(session.RevokedAtUtc);
+
+        // Assert: Revoked token cannot refresh
+        using var refreshResponse =
+            await PostRefreshAsync(rawToken);
+
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            refreshResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task Logout_WithoutCookie_ShouldReturnNoContent()
+    {
+        // Act
+        using var response = await _client.PostAsync(
+            "/api/auth/logout",
+            null);
+
+        // Assert
+        Assert.Equal(
+            HttpStatusCode.NoContent,
+            response.StatusCode);
+
+        // The server should still instruct the browser
+        // to remove the refresh cookie.
+        var cookieHeader = GetRefreshCookieHeader(response);
+
+        Assert.StartsWith(
+            "aldar.refresh=",
+            cookieHeader);
+
+        Assert.Contains(
+            "path=/api/auth",
+            cookieHeader,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Logout_OneSession_ShouldNotRevokeOtherSessions()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        // First login: Laptop
+        using var laptopLogin =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, laptopLogin.StatusCode);
+
+        var laptopToken = GetRefreshToken(laptopLogin);
+
+        // Second login: Phone
+        using var phoneLogin =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(HttpStatusCode.OK, phoneLogin.StatusCode);
+
+        var phoneToken = GetRefreshToken(phoneLogin);
+
+        Assert.NotEqual(laptopToken, phoneToken);
+
+        // Act: Logout from laptop
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "/api/auth/logout");
+
+        request.Headers.TryAddWithoutValidation(
+            "Cookie",
+            $"aldar.refresh={laptopToken}");
+
+        using var logoutResponse =
+            await _client.SendAsync(request);
+
+        // Assert: Logout succeeds
+        Assert.Equal(
+            HttpStatusCode.NoContent,
+            logoutResponse.StatusCode);
+
+        // Laptop session is no longer valid
+        using var laptopRefresh =
+            await PostRefreshAsync(laptopToken);
+
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            laptopRefresh.StatusCode);
+
+        // Phone session still works
+        using var phoneRefresh =
+            await PostRefreshAsync(phoneToken);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            phoneRefresh.StatusCode);
+
+        // Verify database state
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+        var laptopSession =
+            await dbContext.RefreshTokens
+                .AsNoTracking()
+                .SingleAsync(x =>
+                    x.TokenHash ==
+                    RefreshTokenSecurity.HashToken(laptopToken));
+
+        var phoneSession =
+            await dbContext.RefreshTokens
+                .AsNoTracking()
+                .SingleAsync(x =>
+                    x.TokenHash ==
+                    RefreshTokenSecurity.HashToken(phoneToken));
+
+        Assert.NotNull(laptopSession.RevokedAtUtc);
+        Assert.NotEqual(laptopSession.FamilyId, phoneSession.FamilyId);
+        Assert.NotNull(phoneSession.ConsumedAtUtc);
+        Assert.Null(phoneSession.RevokedAtUtc);
+    }
+
     // ------------------------------------------------------
-    // Test helpers
+    // Private helpers
     // ------------------------------------------------------
 
-    private async Task<(string UserId, string Email, string Password)>
-        CreateConfirmedStudentAsync()
+    private async Task<(string UserId, string Email, string Password)>CreateConfirmedStudentAsync()
     {
         using var scope = _factory.Services.CreateScope();
 
@@ -309,9 +487,7 @@ public sealed class RefreshTests
         return (user.Id, email, password);
     }
 
-    private Task<HttpResponseMessage> LoginAsync(
-        string email,
-        string password)
+    private Task<HttpResponseMessage> LoginAsync(string email,string password)
     {
         return _client.PostAsJsonAsync(
             "/api/auth/login",
@@ -322,8 +498,7 @@ public sealed class RefreshTests
             });
     }
 
-    private async Task<HttpResponseMessage> PostRefreshAsync(
-        string rawToken)
+    private async Task<HttpResponseMessage> PostRefreshAsync(string rawToken)
     {
         using var request = new HttpRequestMessage(
             HttpMethod.Post,
@@ -336,8 +511,7 @@ public sealed class RefreshTests
         return await _client.SendAsync(request);
     }
 
-    private static string GetRefreshCookieHeader(
-        HttpResponseMessage response)
+    private static string GetRefreshCookieHeader(HttpResponseMessage response)
     {
         Assert.True(
             response.Headers.TryGetValues(
@@ -351,8 +525,7 @@ public sealed class RefreshTests
                 StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string GetRefreshToken(
-        HttpResponseMessage response)
+    private static string GetRefreshToken(HttpResponseMessage response)
     {
         var header = GetRefreshCookieHeader(response);
 

@@ -227,6 +227,11 @@ public sealed class AuthService : IAuthService
         return new AuthenticationResult(response, rotatedSession.RefreshSession);
     }
 
+    public Task LogoutAsync(string? rawToken, CancellationToken cancellationToken = default)
+    {
+        return _refreshSessionRotator.RevokeAsync( rawToken,cancellationToken);
+    }
+
 
     // ============================= Private Methods =============================
 

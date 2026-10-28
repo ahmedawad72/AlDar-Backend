@@ -156,6 +156,30 @@ public sealed class RefreshSessionRotator(
             new CreatedRefreshSession(newRawToken,newExpiration));
     }
 
+    public async Task RevokeAsync(string? rawToken,CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(rawToken))
+            return;
+
+        // 1. Hash the token supplied through the cookie.
+        var tokenHash = RefreshTokenSecurity.HashToken(rawToken);
+
+        // 2. Find the session family.
+        var familyId = await dbContext.RefreshTokens
+            .AsNoTracking()
+            .Where(x => x.TokenHash == tokenHash)
+            .Select(x => (Guid?)x.FamilyId)
+            .SingleOrDefaultAsync(cancellationToken);
+
+        if (familyId is null)
+            return;
+
+        // 3. Revoke the entire browser session family.
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+
+        await RevokeFamilyAsync( familyId.Value,now,cancellationToken);
+    }
+
     private async Task RevokeFamilyAsync(Guid familyId,DateTime now,CancellationToken cancellationToken)
     {
         await dbContext.RefreshTokens
