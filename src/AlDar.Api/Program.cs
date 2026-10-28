@@ -3,10 +3,9 @@ using AlDar.Infrastructure.Identity;
 using Serilog;
 
 
-
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers();
+builder.Services.AddControllersWithViews();
 builder.Services.AddSwaggerServices();
 builder.Services.AddCorsServices();
 
@@ -14,6 +13,17 @@ builder.AddAlDarLogging();
 
 builder.Services.AddGlobalExceptionHandler();
 builder.Services.AddInfrastructure(builder.Configuration);
+
+builder.Services.AddAntiforgery(options =>
+{
+    options.HeaderName = "X-CSRF-TOKEN";
+
+    options.Cookie.Name = "aldar.csrf";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.Path = "/api/auth";
+});
 
 var app = builder.Build();
 

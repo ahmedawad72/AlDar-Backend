@@ -1,4 +1,4 @@
-﻿
+
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -133,14 +133,19 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
     [Fact]
     public async Task Refresh_WithoutCookie_ShouldReturnUnauthorized()
     {
-        // Act
-        using var response =
-            await _client.PostAsync("/api/auth/refresh", null);
+        // Act: Send valid CSRF credentials,
+        // but do not send a refresh token.
+        using var response = await CsrfTestRequest.PostAsync(
+            _client,
+            "/api/auth/refresh");
 
         // Assert
-        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            response.StatusCode);
 
-        Assert.False(response.Headers.Contains("Set-Cookie"));
+        Assert.False(
+            response.Headers.Contains("Set-Cookie"));
     }
 
     [Fact]
@@ -288,16 +293,8 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
 
         var rawToken = GetRefreshToken(loginResponse);
 
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post,
-            "/api/auth/logout");
-
-        request.Headers.TryAddWithoutValidation(
-            "Cookie",
-            $"aldar.refresh={rawToken}");
-
-        // Act
-        using var response = await _client.SendAsync(request);
+        // Act: supply the refresh cookie AND valid CSRF credentials.
+        using var response = await PostLogoutAsync(rawToken);
 
         // Assert: Logout succeeds
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
@@ -348,10 +345,8 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
     [Fact]
     public async Task Logout_WithoutCookie_ShouldReturnNoContent()
     {
-        // Act
-        using var response = await _client.PostAsync(
-            "/api/auth/logout",
-            null);
+        // Act: no refresh cookie, but a valid CSRF token.
+        using var response = await PostLogoutAsync();
 
         // Assert
         Assert.Equal(
@@ -396,17 +391,8 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
 
         Assert.NotEqual(laptopToken, phoneToken);
 
-        // Act: Logout from laptop
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post,
-            "/api/auth/logout");
-
-        request.Headers.TryAddWithoutValidation(
-            "Cookie",
-            $"aldar.refresh={laptopToken}");
-
-        using var logoutResponse =
-            await _client.SendAsync(request);
+        // Act: Logout from laptop with valid CSRF credentials.
+        using var logoutResponse = await PostLogoutAsync(laptopToken);
 
         // Assert: Logout succeeds
         Assert.Equal(
@@ -585,6 +571,92 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
             HttpStatusCode.OK,
             nextRefresh.StatusCode);
     }
+
+    [Fact]
+    public async Task Logout_WhenRefreshRunsConcurrently_ShouldLeaveNoActiveSession()
+    {
+        // Arrange
+        var user = await CreateConfirmedStudentAsync();
+
+        using var loginResponse =
+            await LoginAsync(user.Email, user.Password);
+
+        Assert.Equal(
+            HttpStatusCode.OK,
+            loginResponse.StatusCode);
+
+        var originalToken = GetRefreshToken(loginResponse);
+
+        // Act: Start refresh and logout concurrently.
+        // Both helpers attach their own matching CSRF credentials.
+        var refreshTask = PostRefreshAsync(originalToken);
+        var logoutTask = PostLogoutAsync(originalToken);
+
+        await Task.WhenAll(refreshTask, logoutTask);
+
+        using var refreshResponse = await refreshTask;
+        using var logoutResponse = await logoutTask;
+
+        // Assert: Logout must succeed.
+        Assert.Equal(
+            HttpStatusCode.NoContent,
+            logoutResponse.StatusCode);
+
+        // Refresh may succeed or be rejected depending
+        // on which operation acquires the database lock first.
+        Assert.True(
+            refreshResponse.StatusCode is
+                HttpStatusCode.OK or HttpStatusCode.Unauthorized,
+            $"Unexpected refresh status: {refreshResponse.StatusCode}");
+
+        // If refresh succeeded, capture its replacement token.
+        var tokenToRetry = refreshResponse.StatusCode ==
+            HttpStatusCode.OK
+                ? GetRefreshToken(refreshResponse)
+                : originalToken;
+
+        // The session must be unusable after both complete.
+        using var retryResponse =
+            await PostRefreshAsync(tokenToRetry);
+
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            retryResponse.StatusCode);
+
+        // Verify all session records are revoked.
+        using var scope = _factory.Services.CreateScope();
+
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AlDarDbContext>();
+
+        var sessions = await dbContext.RefreshTokens
+            .AsNoTracking()
+            .Where(x => x.UserId == user.UserId)
+            .ToListAsync();
+
+        Assert.NotEmpty(sessions);
+
+        Assert.All(
+            sessions,
+            session => Assert.NotNull(session.RevokedAtUtc));
+    }
+
+
+
+
+
+
+    [Fact]
+    public async Task Logout_WithoutCsrfToken_ShouldReturnBadRequest()
+    {
+        // Act: deliberately omit CSRF credentials.
+        using var response = await _client.PostAsync(
+            "/api/auth/logout", null);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
     // ------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------
@@ -636,7 +708,8 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
 
     private Task<HttpResponseMessage> LoginAsync(string email,string password)
     {
-        return _client.PostAsJsonAsync(
+        return CsrfTestRequest.PostAsync(
+            _client,
             "/api/auth/login",
             new
             {
@@ -645,17 +718,12 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
             });
     }
 
-    private async Task<HttpResponseMessage> PostRefreshAsync(string rawToken)
+    private Task<HttpResponseMessage> PostRefreshAsync(string rawToken)
     {
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post,
-            "/api/auth/refresh");
-
-        request.Headers.TryAddWithoutValidation(
-            "Cookie",
-            $"aldar.refresh={rawToken}");
-
-        return await _client.SendAsync(request);
+        return CsrfTestRequest.PostAsync(
+            _client,
+            "/api/auth/refresh",
+            refreshToken: rawToken);
     }
 
     private static string GetRefreshCookieHeader(HttpResponseMessage response)
@@ -686,6 +754,13 @@ public sealed class RefreshTests : IClassFixture<CustomWebApplicationFactory>, I
         return rawToken;
     }
 
+    private Task<HttpResponseMessage> PostLogoutAsync(string? rawToken = null)
+    {
+        return CsrfTestRequest.PostAsync(
+            _client,
+            "/api/auth/logout",
+            refreshToken: rawToken);
+    }
     public void Dispose()
     {
         _client.Dispose();

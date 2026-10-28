@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 namespace AlDar.Api.Controllers;
+using Microsoft.AspNetCore.Antiforgery;
 
 [ApiController]
 [Route("api/[controller]")]
@@ -57,6 +58,8 @@ public class AuthController : ControllerBase
 
 
     [HttpPost("login")]
+    [AllowAnonymous]
+    [ValidateAntiForgeryToken]
     public async Task<ActionResult<LoginResponse>> Login(LoginRequest request)
     {
         var result = await _authService.LoginAsync(request);
@@ -79,16 +82,15 @@ public class AuthController : ControllerBase
 
     [HttpPost("refresh")]
     [AllowAnonymous]
-    public async Task<ActionResult<LoginResponse>> Refresh( CancellationToken cancellationToken)
+    [ValidateAntiForgeryToken]
+    public async Task<ActionResult<LoginResponse>> Refresh(CancellationToken cancellationToken)
     {
-        // 1. Read the refresh token from the HttpOnly cookie.
         if (!Request.Cookies.TryGetValue(
                 "aldar.refresh", out var rawToken))
         {
             return Unauthorized();
         }
 
-        // 2. Validate the user and rotate the refresh session.
         var result = await _authService.RefreshAsync(
             rawToken,
             cancellationToken);
@@ -96,7 +98,6 @@ public class AuthController : ControllerBase
         if (result is null)
             return Unauthorized();
 
-        // 3. Replace the browser's refresh cookie.
         Response.Cookies.Append(
             "aldar.refresh",
             result.RefreshSession.RawToken,
@@ -111,12 +112,12 @@ public class AuthController : ControllerBase
                     TimeSpan.Zero)
             });
 
-        // 4. Return only the JWT and current user information.
         return Ok(result.Response);
     }
 
     [HttpPost("logout")]
     [AllowAnonymous]
+    [ValidateAntiForgeryToken]
     public async Task<IActionResult> Logout(CancellationToken cancellationToken)
     {
         // 1. Retrieve the refresh credential, if present.
@@ -138,6 +139,21 @@ public class AuthController : ControllerBase
 
         // 4. Always return success after processing.
         return NoContent();
+    }
+
+
+    [HttpGet("csrf")]
+    [AllowAnonymous]
+    public IActionResult GetCsrf([FromServices] IAntiforgery antiforgery)
+    {
+        var tokens = antiforgery.GetAndStoreTokens(HttpContext);
+
+        Response.Headers["Cache-Control"] = "no-store";
+
+        return Ok(new
+        {
+            token = tokens.RequestToken
+        });
     }
 
     [Authorize]

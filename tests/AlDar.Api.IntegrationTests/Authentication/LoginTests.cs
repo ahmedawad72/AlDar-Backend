@@ -1,4 +1,4 @@
-﻿using AlDar.Api.IntegrationTests.Fakes;
+using AlDar.Api.IntegrationTests.Fakes;
 using AlDar.Application.Authentication;
 using AlDar.Application.Exceptions;
 using AlDar.Domain.Constants;
@@ -24,7 +24,13 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
     public LoginTests(CustomWebApplicationFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateClient(
+            new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions
+            {
+                BaseAddress = new Uri("https://localhost"),
+                HandleCookies = false,
+                AllowAutoRedirect = false
+            });
     }
 
     [Fact]
@@ -40,7 +46,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 request);
 
@@ -95,7 +102,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 loginRequest);
 
@@ -208,7 +216,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 loginRequest);
 
@@ -327,7 +336,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
         for (var attempt = 1; attempt <= 5; attempt++)
         {
             var failedResponse =
-                await _client.PostAsJsonAsync(
+                await CsrfTestRequest.PostAsync(
+                    _client,
                     "/api/auth/login",
                     wrongLoginRequest);
 
@@ -345,7 +355,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             };
 
         var lockedResponse =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 correctLoginRequest);
 
@@ -478,7 +489,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             confirmResponse.StatusCode);
 
         var loginResponse =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 new LoginRequest
                 {
@@ -546,7 +558,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act
         var response =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 request);
 
@@ -630,7 +643,8 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
 
         // Act: Login
         var loginResponse =
-            await _client.PostAsJsonAsync(
+            await CsrfTestRequest.PostAsync(
+                _client,
                 "/api/auth/login",
                 new LoginRequest
                 {
@@ -736,6 +750,24 @@ public class LoginTests : IClassFixture<CustomWebApplicationFactory>
             responseJson);
     }
 
+
+    [Fact]
+    public async Task Login_WithoutCsrfToken_ShouldReturnBadRequest()
+    {
+        // Arrange: a syntactically valid login request without CSRF credentials.
+        var request = new LoginRequest
+        {
+            Email = "missing-csrf@test.com",
+            Password = "Password123!"
+        };
+
+        // Act: deliberately bypass CsrfTestRequest.
+        using var response = await _client.PostAsJsonAsync(
+            "/api/auth/login", request);
+
+        // Assert: CSRF validation rejects the request before login executes.
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
 
     // _____________________________Private Helper Methods_____________________________
     private static string ExtractConfirmationLink( string htmlBody)

@@ -20,7 +20,8 @@ namespace Microsoft.Extensions.DependencyInjection
                  options.AddPolicy("AlDarClient", policy =>
                         policy.WithOrigins("http://localhost:4200")
                               .AllowAnyHeader()
-                              .AllowAnyMethod());
+                              .AllowAnyMethod()
+                              .AllowCredentials());
             });
 
             return services;
